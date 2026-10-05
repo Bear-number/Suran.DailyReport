@@ -17,6 +17,7 @@ using Alife.Foundation;
 using Alife.Function.FunctionCaller;
 using Alife.Framework;
 using Microsoft.Extensions.Logging;
+using Microsoft.Win32;
 
 namespace Suran.DailyReport;
 
@@ -560,7 +561,7 @@ public class GroupDailyReportModule(
                 {
                     string textReport = BuildTextReport(groupName, messages.Count, participants, activeRange,
                         topUsers, analysis, botName, windowStart, windowEnd);
-                    await SendGroupTextAsync(groupId, "（未找到可用的系统浏览器，改用文字日报）\n" + textReport);
+                    await SendGroupTextAsync(groupId, "（图片渲染不可用，已改用文字日报，详情见插件日志）\n" + textReport);
                 }
             }
 
@@ -864,31 +865,56 @@ public class GroupDailyReportModule(
             + Math.Min(topUsers.Count, Configuration.TopUserCount) * 44
             + analysis.Quotes.Count * 86
             + 200;
-        string arguments = "--headless=new --disable-gpu --hide-scrollbars "
-            + "--screenshot=\"" + imagePath + "\" "
-            + "--window-size=760," + Math.Clamp(estimatedHeight, 800, 3000) + " "
-            + "--default-background-color=00000000 "
-            + "\"" + new Uri(htmlPath).AbsoluteUri + "\"";
+        string windowSize = "--window-size=760," + Math.Clamp(estimatedHeight, 800, 3000) + " ";
+        string pageUrl = new Uri(htmlPath).AbsoluteUri;
+        // 独立 user-data-dir：避免 Edge/Chrome 因已有实例或策略拒绝无头启动
+        string userDataDir = "--user-data-dir=\"" + Path.Combine(Path.GetTempPath(), "suran_daily_report_profile") + "\" ";
+        string edgeFlag = browserPath.Contains("msedge", StringComparison.OrdinalIgnoreCase)
+            ? "--edge-skip-compat-layer-relaunch "
+            : "";
 
-        ProcessStartInfo startInfo = new()
+        // 新旧两版无头模式依次尝试
+        string[] attempts = new[]
         {
-            FileName = browserPath,
-            Arguments = arguments,
-            UseShellExecute = false,
-            CreateNoWindow = true
+            "--headless=new " + edgeFlag,
+            "--headless " + edgeFlag
         };
-        using Process? browserProcess = Process.Start(startInfo);
-        if (browserProcess == null)
+        string lastError = "浏览器未产出截图";
+        foreach (string headlessFlag in attempts)
         {
-            return false;
+            ProcessStartInfo startInfo = new()
+            {
+                FileName = browserPath,
+                Arguments = headlessFlag + "--disable-gpu --no-first-run --no-default-browser-check --hide-scrollbars "
+                    + userDataDir + windowSize
+                    + "--screenshot=\"" + imagePath + "\" "
+                    + "\"" + pageUrl + "\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardError = true
+            };
+            using Process? browserProcess = Process.Start(startInfo);
+            if (browserProcess == null)
+            {
+                lastError = "浏览器进程启动失败";
+                continue;
+            }
+            string browserStdError = await browserProcess.StandardError.ReadToEndAsync();
+            await browserProcess.WaitForExitAsync(new CancellationTokenSource(TimeSpan.FromSeconds(120)).Token);
+            if (File.Exists(imagePath))
+            {
+                await SendReportImageAsync(groupId, imagePath);
+                return true;
+            }
+            lastError = "无头渲染未产出截图：" + (browserStdError.Length > 300 ? browserStdError[..300] : browserStdError);
+            LogDetail(lastError);
         }
-        await browserProcess.WaitForExitAsync(new CancellationTokenSource(TimeSpan.FromSeconds(120)).Token);
-        if (File.Exists(imagePath) == false)
-        {
-            LogDetail("截图未生成: " + imagePath);
-            return false;
-        }
+        logger.LogWarning("日报渲染失败（浏览器: {Browser}）：{Error}", browserPath, lastError);
+        return false;
+    }
 
+    async Task SendReportImageAsync(long groupId, string imagePath)
+    {
         JsonObject imageSegment = new()
         {
             ["type"] = "image",
@@ -903,11 +929,42 @@ public class GroupDailyReportModule(
         };
         string sendResponse = await CallActionAsync("send_group_msg", sendParameters);
         ParseActionResponse(sendResponse, "发送日报图片");
-        return true;
     }
 
+    // 浏览器发现：注册表 App Paths（Windows 解析浏览器的标准途径）为主，常见安装路径兜底
     static string? FindBrowserExecutable()
     {
+        string[] browserNames = new[] { "msedge.exe", "chrome.exe", "chromium.exe", "brave.exe" };
+        foreach (string browserName in browserNames)
+        {
+            string keyPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\" + browserName;
+            foreach (RegistryHive hive in new[] { RegistryHive.LocalMachine, RegistryHive.CurrentUser })
+            {
+                foreach (RegistryView view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
+                {
+                    try
+                    {
+                        using RegistryKey? baseKey = RegistryKey.OpenBaseKey(hive, view);
+                        using RegistryKey? appKey = baseKey.OpenSubKey(keyPath);
+                        if (appKey?.GetValue(null) is string registeredPath == false || string.IsNullOrWhiteSpace(registeredPath))
+                        {
+                            continue;
+                        }
+                        string cleanPath = registeredPath.Trim().Trim('"');
+                        string expandedPath = Environment.ExpandEnvironmentVariables(cleanPath);
+                        if (File.Exists(expandedPath))
+                        {
+                            return expandedPath;
+                        }
+                    }
+                    catch
+                    {
+                        // 单个注册表位置读不到不影响其余探测
+                    }
+                }
+            }
+        }
+
         string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
         string programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
         string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
@@ -917,7 +974,8 @@ public class GroupDailyReportModule(
             Path.Combine(programFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
             Path.Combine(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
             Path.Combine(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
-            Path.Combine(localAppData, "Google", "Chrome", "Application", "chrome.exe")
+            Path.Combine(localAppData, "Google", "Chrome", "Application", "chrome.exe"),
+            Path.Combine(localAppData, "Chromium", "Application", "chrome.exe")
         };
         return candidates.FirstOrDefault(File.Exists);
     }
