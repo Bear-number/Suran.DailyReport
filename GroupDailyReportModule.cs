@@ -188,10 +188,14 @@ public class GroupDailyReportModule(
             return;
         }
         lastAutoFiredDate = now.Date;
-        List<long> scheduledGroupIds = ResolveScheduledGroupIds();
+        List<long> scheduledGroupIds = await ResolveScheduledGroupIds();
         foreach (long groupId in scheduledGroupIds)
         {
             if (generatingGroups.ContainsKey(groupId))
+            {
+                continue;
+            }
+            if (CheckCooldown(groupId, 0))
             {
                 continue;
             }
@@ -216,24 +220,43 @@ public class GroupDailyReportModule(
         logger.LogInformation("群聊日报插件已卸载");
     }
 
-    List<long> ResolveScheduledGroupIds()
+    // 定时群组解析：显式配置优先；两者都留空时按原版语义“留空=所有群”，从协议端取全部群
+    async Task<List<long>> ResolveScheduledGroupIds()
     {
         string raw = Configuration.ScheduledGroups.Trim();
         if (raw.Length == 0)
         {
             raw = Configuration.EnabledGroups;
         }
-        if (raw.Trim().Length == 0)
+        if (raw.Trim().Length > 0)
         {
-            // 都未配置时按“所有群”没有意义（不知道群号），返回空集，日志提示
-            logger.LogWarning("自动日报未配置定时群组或可使用群组，无法确定要生成日报的群");
+            return raw
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(text => long.TryParse(text, out long parsed) ? parsed : 0)
+                .Where(id => id > 0)
+                .ToList();
+        }
+        try
+        {
+            string response = await CallActionAsync("get_group_list", new JsonObject());
+            JsonElement data = ParseActionResponse(response, "获取群列表");
+            List<long> groupIds = new();
+            foreach (JsonElement group in data.EnumerateArray())
+            {
+                long id = GetNumericField(group, "group_id");
+                if (id > 0)
+                {
+                    groupIds.Add(id);
+                }
+            }
+            LogDetail("自动日报未配置群组，按所有群处理（" + groupIds.Count + " 个）");
+            return groupIds;
+        }
+        catch (Exception listError)
+        {
+            logger.LogWarning("自动日报获取群列表失败：{Message}", listError.Message);
             return new List<long>();
         }
-        return raw
-            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Select(text => long.TryParse(text, out long parsed) ? parsed : 0)
-            .Where(id => id > 0)
-            .ToList();
     }
 
     // ============================================================
@@ -901,12 +924,23 @@ public class GroupDailyReportModule(
             }
             string browserStdError = await browserProcess.StandardError.ReadToEndAsync();
             await browserProcess.WaitForExitAsync(new CancellationTokenSource(TimeSpan.FromSeconds(120)).Token);
-            if (File.Exists(imagePath))
+            // Chrome 退出后截图可能由子进程延迟落盘，轮询等待最多6秒
+            bool screenshotReady = false;
+            for (int wait = 0; wait < 20; wait++)
+            {
+                if (File.Exists(imagePath))
+                {
+                    screenshotReady = true;
+                    break;
+                }
+                await Task.Delay(TimeSpan.FromMilliseconds(300));
+            }
+            if (screenshotReady)
             {
                 await SendReportImageAsync(groupId, imagePath);
                 return true;
             }
-            lastError = "无头渲染未产出截图：" + (browserStdError.Length > 300 ? browserStdError[..300] : browserStdError);
+            lastError = "无头渲染未产出截图（进程退出后6秒内未出现文件）：" + (browserStdError.Length > 300 ? browserStdError[..300] : browserStdError);
             LogDetail(lastError);
         }
         logger.LogWarning("日报渲染失败（浏览器: {Browser}）：{Error}", browserPath, lastError);
