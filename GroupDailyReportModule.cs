@@ -38,6 +38,10 @@ public class DailyReportConfig
     [Description("群号英文逗号分隔，留空=所有群")]
     public string EnabledGroups { get; set; } = "";
 
+    [DisplayName("基础·定时排除的群组")]
+    [Description("群号英文逗号分隔，这些群不参与定时自动生成（不影响手动生成）")]
+    public string DisabledGroups { get; set; } = "";
+
     [DisplayName("基础·定时开启日报的群组")]
     [Description("群号英文逗号分隔，留空=与可使用群组一致")]
     public string ScheduledGroups { get; set; } = "";
@@ -197,6 +201,15 @@ public class GroupDailyReportModule(
         foreach (long groupId in scheduledGroupIds)
         {
             if (generatingGroups.ContainsKey(groupId))
+            {
+                continue;
+            }
+            // 定时排除名单：只拦定时生成，不影响手动
+            if (SplitList(Configuration.DisabledGroups).Contains(groupId.ToString(CultureInfo.InvariantCulture)))
+            {
+                continue;
+            }
+            if (IsGroupAllowed(groupId) == false)
             {
                 continue;
             }
@@ -486,7 +499,7 @@ public class GroupDailyReportModule(
         {
             return true;
         }
-        return SplitList(raw).Contains(groupId.ToString());
+        return SplitList(raw).Contains(groupId.ToString(CultureInfo.InvariantCulture));
     }
 
     bool TryStartReport(long groupId, string operatorId)
