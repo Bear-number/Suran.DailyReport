@@ -1111,7 +1111,7 @@ public class GroupDailyReportModule(
         {
             string topicAvatar = topic.Uid > 0 ? await LoadAvatarDataUriAsync(topic.Uid) : "";
             string initiator = topic.Uid > 0 && currentParticipants.TryGetValue(topic.Uid, out string? name) ? name : "";
-            topicsBuilder.Append("<div class=\"topic\">").Append(AvatarMarkup(topicAvatar, initiator, "t-avatar"))
+            topicsBuilder.Append("<div class=\"topic\">")
                 .Append("<div class=\"topic-body\"><div class=\"t-name\">").Append(EscapeHtml(topic.Title))
                 .Append("</div><div class=\"t-sum\">").Append(EscapeHtml(topic.Summary));
             if (initiator.Length > 0)
@@ -1123,7 +1123,7 @@ public class GroupDailyReportModule(
             {
                 topicsBuilder.Append("<div class=\"t-cmt\">评：").Append(EscapeHtml(topic.Comment)).Append("</div>");
             }
-            topicsBuilder.Append("</div></div>");
+            topicsBuilder.Append("</div>").Append(AvatarMarkup(topicAvatar, initiator, "t-avatar")).Append("</div>");
         }
 
         StringBuilder usersBuilder = new();

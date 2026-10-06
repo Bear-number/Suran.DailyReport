@@ -39,8 +39,8 @@ body {
 .stat .label { font-size: 12px; color: var(--soft); margin-top: 4px; }
 .section-title { font-size: 16px; font-weight: 800; color: var(--accent); margin-bottom: 10px; }
 .topic { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 12px; padding-left: 12px; border-left: 4px solid var(--primary); }
-.t-avatar, .ph.t-avatar { width: 38px; height: 38px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }
-.topic-body { flex: 1; min-width: 0; }
+.t-avatar, .ph.t-avatar { width: 38px; height: 38px; border-radius: 50%; object-fit: cover; flex-shrink: 0; margin-left: auto; }
+.topic-body { flex: 1; min-width: 0; text-align: left; }
 .topic .t-name { font-size: 15px; font-weight: 700; }
 .topic .t-sum { font-size: 12px; color: var(--soft); margin-top: 2px; line-height: 1.5; }
 .t-starter { color: var(--primary); }
