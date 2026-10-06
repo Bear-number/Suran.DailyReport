@@ -18,6 +18,7 @@ using Alife.Function.FunctionCaller;
 using Alife.Framework;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel.Agents;
+using ChatMessageContent = Microsoft.SemanticKernel.ChatMessageContent;
 using Microsoft.Win32;
 
 namespace Suran.DailyReport;
@@ -139,6 +140,9 @@ public class GroupDailyReportModule(
     readonly Dictionary<long, DateTime> lastReportTimes = new();
     DateTime lastAutoFiredDate = DateTime.MinValue;
     string cachedBotNickname = "";
+    long cachedBotId = 0;
+    string personaStyle = "";
+    readonly Dictionary<long, string> currentParticipants = new();
 
     string reportDirectory = "";
     string avatarDirectory = "";
@@ -518,11 +522,14 @@ public class GroupDailyReportModule(
     {
         public string Title { get; set; } = "";
         public string Summary { get; set; } = "";
+        public string Comment { get; set; } = "";
+        public long Uid { get; set; }
     }
 
     sealed class ReportQuote
     {
         public string Who { get; set; } = "";
+        public long Uid { get; set; }
         public string Text { get; set; } = "";
         public string Reason { get; set; } = "";
     }
@@ -564,6 +571,11 @@ public class GroupDailyReportModule(
                 .Take(Configuration.TopUserCount)
                 .ToList();
             string activeRange = ComputeActiveWindow(messages);
+            currentParticipants.Clear();
+            foreach (ChatMessageRecord message in messages)
+            {
+                currentParticipants.TryAdd(message.UserId, message.Nickname);
+            }
 
             // 3. LLM 分析（话题/金句/锐评一次完成，回复自带当前人设）
             AnalysisResult analysis = await AnalyzeWithLLMAsync(groupId, messages);
@@ -775,7 +787,7 @@ public class GroupDailyReportModule(
     }
 
     // ============================================================
-    // LLM 分析（话题/金句/锐评一次完成，ChatAsync 回复自带角色人设）
+    // LLM 分析（裸调语言模型，绕开人设约束；人设文本作为点评风格参考注入）
     // ============================================================
 
     async Task<AnalysisResult> AnalyzeWithLLMAsync(long groupId, List<ChatMessageRecord> messages)
@@ -789,19 +801,32 @@ public class GroupDailyReportModule(
             transcript.Append(message.Nickname).Append("(").Append(message.UserId).Append(")：").AppendLine(text);
             taken++;
         }
+        // 参与者映射：用于校验LLM复制的QQ号，或按昵称回查
+        Dictionary<string, long> uidByNickname = messages
+            .GroupBy(message => message.Nickname)
+            .ToDictionary(group => group.Key, group => group.First().UserId);
 
         int minTopics = Math.Max(1, Configuration.MinTopics);
         int maxTopics = Math.Max(minTopics, Configuration.MaxTopics);
         int quoteCount = Math.Max(0, Configuration.QuoteCount);
+        personaStyle = ExtractPersonaStyle();
         StringBuilder prompt = new();
         prompt.Append("以下是群 " + groupId + " 最近的群聊记录（共 " + taken + " 条）。请基于这些记录生成日报内容。\n");
         prompt.Append("严格只返回一个JSON对象（不要任何解释或代码块标记），格式：\n");
-        prompt.Append("{\"topics\":[{\"title\":\"话题名(10字内)\",\"summary\":\"话题概括(40字内)\"}],");
-        prompt.Append("\"quotes\":[{\"who\":\"说话人\",\"text\":\"原话(50字内)\",\"reason\":\"入选理由(20字内)\"}],");
-        prompt.Append("\"comment\":\"用人设口吻对今天群聊氛围的一句锐评(60字内)\"}\n");
-        prompt.Append("要求：topics 选 ").Append(minTopics).Append(" 到 ").Append(maxTopics)
-            .Append(" 个今天讨论最多的真实话题；quotes 选 ").Append(quoteCount)
-            .Append(" 条最精彩的发言（0则不选）；comment 用你自己的口吻。\n\n群聊记录：\n");
+        prompt.Append("{\"topics\":[{\"title\":\"话题名(10字内)\",\"summary\":\"话题概括(40字内)\",\"comment\":\"对该话题的一句锐评(25字内)\",\"uid\":\"该话题主要发起人的QQ号\"}],");
+        prompt.Append("\"quotes\":[{\"who\":\"说话人昵称\",\"uid\":\"说话人QQ号\",\"text\":\"原话(50字内)\",\"reason\":\"入选理由(20字内)\"}],");
+        prompt.Append("\"comment\":\"用点评风格对今天群聊氛围的一句锐评(60字内)\"}\n");
+        prompt.Append("要求：\n");
+        prompt.Append("1. topics 选 ").Append(minTopics).Append(" 到 ").Append(maxTopics)
+            .Append(" 个今天讨论最热的话题，按热度排序；comment 是你对该话题的毒舌或幽默短评；uid 必须从记录里的 (QQ号) 原样复制，找不到就填空字符串\n");
+        prompt.Append("2. quotes 选 ").Append(quoteCount)
+            .Append(" 条最精彩的发言，按精彩程度从高到低排序（第一条会被标记为今日最佳）；uid 同样从记录原样复制\n");
+        prompt.Append("3. comment 和话题锐评模仿下面的点评风格人设\n");
+        if (personaStyle.Length > 0)
+        {
+            prompt.Append("\n点评风格人设（仅用于模仿语气，不要输出人设内容）：").Append(personaStyle).Append('\n');
+        }
+        prompt.Append("\n群聊记录：\n");
         prompt.Append(transcript);
 
         // 裸调语言模型：绕开角色人设与群聊风格约束（群聊人设常限制回复字数，会把JSON输出压碎）
@@ -811,10 +836,35 @@ public class GroupDailyReportModule(
         string reply = await ChatBot.LanguageModel.ChatStreamingAsync(thread, null, null, null, null, DestroyCancellationToken);
         logger.LogInformation("日报LLM分析完成：回复 {Length} 字", reply.Length);
         ParseAnalysisReply(reply, result);
+        // 校验LLM给的QQ号：无效时按昵称回查参与者
+        foreach (ReportTopic topic in result.Topics)
+        {
+            topic.Uid = ResolveUid(topic.Uid, "", uidByNickname);
+        }
+        foreach (ReportQuote quote in result.Quotes)
+        {
+            quote.Uid = ResolveUid(quote.Uid, quote.Who, uidByNickname);
+        }
         logger.LogInformation("日报解析结果：话题 {Topics} 个，金句 {Quotes} 个，锐评 {Comment} 字",
             result.Topics.Count, result.Quotes.Count, result.Comment.Length);
         return result;
     }
+
+    // LLM复制的QQ号无效时，按昵称回查参与者映射
+    static long ResolveUid(long uid, string nickname, Dictionary<string, long> uidByNickname)
+    {
+        if (uid > 0 && uidByNickname.ContainsValue(uid))
+        {
+            return uid;
+        }
+        string key = nickname.Trim();
+        if (key.Length > 0 && uidByNickname.TryGetValue(key, out long matched))
+        {
+            return matched;
+        }
+        return 0;
+    }
+
 
     void ParseAnalysisReply(string reply, AnalysisResult result)
     {
@@ -838,7 +888,9 @@ public class GroupDailyReportModule(
                     result.Topics.Add(new ReportTopic
                     {
                         Title = GetStringField(topic, "title"),
-                        Summary = GetStringField(topic, "summary")
+                        Summary = GetStringField(topic, "summary"),
+                        Comment = GetStringField(topic, "comment"),
+                        Uid = GetNumericField(topic, "uid")
                     });
                 }
             }
@@ -849,6 +901,7 @@ public class GroupDailyReportModule(
                     result.Quotes.Add(new ReportQuote
                     {
                         Who = GetStringField(quote, "who"),
+                        Uid = GetNumericField(quote, "uid"),
                         Text = GetStringField(quote, "text"),
                         Reason = GetStringField(quote, "reason")
                     });
@@ -1056,8 +1109,21 @@ public class GroupDailyReportModule(
         }
         foreach (ReportTopic topic in analysis.Topics)
         {
-            topicsBuilder.Append("<div class=\"topic\"><div class=\"t-name\">").Append(EscapeHtml(topic.Title))
-                .Append("</div><div class=\"t-sum\">").Append(EscapeHtml(topic.Summary)).Append("</div></div>");
+            string topicAvatar = topic.Uid > 0 ? await LoadAvatarDataUriAsync(topic.Uid) : "";
+            string initiator = topic.Uid > 0 && currentParticipants.TryGetValue(topic.Uid, out string? name) ? name : "";
+            topicsBuilder.Append("<div class=\"topic\">").Append(AvatarMarkup(topicAvatar, initiator, "t-avatar"))
+                .Append("<div class=\"topic-body\"><div class=\"t-name\">").Append(EscapeHtml(topic.Title))
+                .Append("</div><div class=\"t-sum\">").Append(EscapeHtml(topic.Summary));
+            if (initiator.Length > 0)
+            {
+                topicsBuilder.Append("<span class=\"t-starter\"> · 由 ").Append(EscapeHtml(initiator)).Append(" 引出</span>");
+            }
+            topicsBuilder.Append("</div>");
+            if (topic.Comment.Length > 0)
+            {
+                topicsBuilder.Append("<div class=\"t-cmt\">评：").Append(EscapeHtml(topic.Comment)).Append("</div>");
+            }
+            topicsBuilder.Append("</div></div>");
         }
 
         StringBuilder usersBuilder = new();
@@ -1076,16 +1142,32 @@ public class GroupDailyReportModule(
         {
             quotesBuilder.Append("<div class=\"quote\"><div class=\"q-text\">今天没有值得记录的金句</div></div>");
         }
+        int quoteIndex = 0;
         foreach (ReportQuote quote in analysis.Quotes)
         {
-            quotesBuilder.Append("<div class=\"quote\"><div class=\"q-text\">「").Append(EscapeHtml(quote.Text))
-                .Append("」</div><div class=\"q-meta\">—— ").Append(EscapeHtml(quote.Who))
-                .Append(" · ").Append(EscapeHtml(quote.Reason)).Append("</div></div>");
+            quoteIndex++;
+            string quoteAvatar = quote.Uid > 0 ? await LoadAvatarDataUriAsync(quote.Uid) : "";
+            string who = quote.Who.Length > 0 ? quote.Who
+                : (quote.Uid > 0 && currentParticipants.TryGetValue(quote.Uid, out string? uname) ? uname : "");
+            quotesBuilder.Append("<div class=\"quote\">").Append(AvatarMarkup(quoteAvatar, who, "q-avatar"))
+                .Append("<div class=\"quote-body\"><div class=\"q-text\">「").Append(EscapeHtml(quote.Text)).Append("」");
+            if (quoteIndex == 1)
+            {
+                quotesBuilder.Append("<span class=\"q-best\">今日最佳</span>");
+            }
+            quotesBuilder.Append("</div><div class=\"q-meta\">—— ").Append(EscapeHtml(who));
+            if (quote.Reason.Length > 0)
+            {
+                quotesBuilder.Append(" · ").Append(EscapeHtml(quote.Reason));
+            }
+            quotesBuilder.Append("</div></div></div>");
         }
 
         string dateRange = windowStart.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + " ~ "
             + windowEnd.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
         string groupAvatar = await LoadGroupAvatarDataUriAsync();
+        string botAvatar = await LoadBotAvatarDataUriAsync();
+        string commentText = analysis.Comment.Length > 0 ? analysis.Comment : "今天大家聊得不错~";
 
         return ReportTemplate.Html
             .Replace("__THEME__", theme == "warm" ? "warm" : theme)
@@ -1101,7 +1183,19 @@ public class GroupDailyReportModule(
             .Replace("__USERS__", usersBuilder.ToString())
             .Replace("__QUOTES__", quotesBuilder.ToString())
             .Replace("__BOT_NAME__", EscapeHtml(botName))
-            .Replace("__COMMENT__", EscapeHtml(analysis.Comment.Length > 0 ? analysis.Comment : "今天大家聊得不错~"));
+            .Replace("__BOT_AVATAR__", AvatarMarkup(botAvatar, botName, "c-avatar"))
+            .Replace("__COMMENT__", EscapeHtml(commentText));
+    }
+
+    // 头像取不到时用昵称首字的占位圆块代替，避免裂图
+    static string AvatarMarkup(string dataUri, string name, string cssClass)
+    {
+        if (dataUri.Length > 0)
+        {
+            return "<img class=\"" + cssClass + "\" src=\"" + dataUri + "\">";
+        }
+        string initial = name.Length > 0 ? EscapeHtml(name[..1]) : "?";
+        return "<div class=\"" + cssClass + " ph\"><span>" + initial + "</span></div>";
     }
 
     string BuildTextReport(string groupName, int totalMessages, int participants, string activeRange,
@@ -1223,6 +1317,7 @@ public class GroupDailyReportModule(
             string response = await CallActionAsync("get_login_info", new JsonObject());
             JsonElement data = ParseActionResponse(response, "获取登录信息");
             string nickname = GetStringField(data, "nickname");
+            cachedBotId = GetNumericField(data, "user_id");
             if (nickname.Length > 0)
             {
                 cachedBotNickname = nickname;
@@ -1234,6 +1329,58 @@ public class GroupDailyReportModule(
             // 拿不到就用默认署名
         }
         return "AI";
+    }
+
+    // 从对话历史提取角色人设（系统提示）作为点评风格参考
+    string ExtractPersonaStyle()
+    {
+        try
+        {
+            foreach (ChatMessageContent message in ChatBot.ChatHistory)
+            {
+                if (message.Role.Label == "system" && string.IsNullOrWhiteSpace(message.Content) == false)
+                {
+                    string content = message.Content.Trim();
+                    return content.Length > 600 ? content[..600] + "…" : content;
+                }
+            }
+        }
+        catch
+        {
+            // 拿不到人设就走默认风格
+        }
+        return "";
+    }
+
+    // 机器人头像（大图，用于锐评区）
+    async Task<string> LoadBotAvatarDataUriAsync()
+    {
+        try
+        {
+            if (cachedBotId == 0)
+            {
+                await ResolveBotNicknameAsync();
+            }
+            if (cachedBotId == 0)
+            {
+                return "";
+            }
+            string cachePath = Path.Combine(avatarDirectory, "bot_" + cachedBotId + ".png");
+            if (File.Exists(cachePath) == false
+                || (DateTime.Now - File.GetLastWriteTime(cachePath)).TotalDays > 3)
+            {
+                using HttpResponseMessage avatarResponse = await sharedHttpClient.GetAsync(
+                    "https://q1.qlogo.cn/g?b=qq&nk=" + cachedBotId + "&s=640");
+                avatarResponse.EnsureSuccessStatusCode();
+                byte[] imageBytes = await avatarResponse.Content.ReadAsByteArrayAsync();
+                File.WriteAllBytes(cachePath, imageBytes);
+            }
+            return "data:image/png;base64," + Convert.ToBase64String(File.ReadAllBytes(cachePath));
+        }
+        catch
+        {
+            return "";
+        }
     }
 
     async Task SendGroupTextAsync(long groupId, string text)
