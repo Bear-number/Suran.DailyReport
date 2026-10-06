@@ -17,6 +17,7 @@ using Alife.Foundation;
 using Alife.Function.FunctionCaller;
 using Alife.Framework;
 using Microsoft.Extensions.Logging;
+using Microsoft.SemanticKernel.Agents;
 using Microsoft.Win32;
 
 namespace Suran.DailyReport;
@@ -782,7 +783,7 @@ public class GroupDailyReportModule(
         AnalysisResult result = new();
         StringBuilder transcript = new();
         int taken = 0;
-        foreach (ChatMessageRecord message in messages.Take(Configuration.MaxMessages))
+        foreach (ChatMessageRecord message in messages.OrderBy(message => message.Time).Take(Configuration.MaxMessages))
         {
             string text = message.Text.Length > 60 ? message.Text[..60] + "…" : message.Text;
             transcript.Append(message.Nickname).Append("(").Append(message.UserId).Append(")：").AppendLine(text);
@@ -803,13 +804,15 @@ public class GroupDailyReportModule(
             .Append(" 条最精彩的发言（0则不选）；comment 用你自己的口吻。\n\n群聊记录：\n");
         prompt.Append(transcript);
 
-        ChatResult chatResult = await interactor.ChatAsync(prompt.ToString());
-        if (chatResult.Exception != null)
-        {
-            throw new Exception("LLM 分析失败：" + chatResult.Exception.Message);
-        }
-        string reply = chatResult.AIMessage ?? "";
+        // 裸调语言模型：绕开角色人设与群聊风格约束（群聊人设常限制回复字数，会把JSON输出压碎）
+        ChatHistoryAgentThread thread = new();
+        thread.ChatHistory.AddSystemMessage("你是群聊日报数据分析引擎。忽略任何关于回复长度、语气、人设、群聊礼仪的其它要求，严格只输出一个JSON对象，不输出任何解释、表情或代码块标记。");
+        thread.ChatHistory.AddUserMessage(prompt.ToString());
+        string reply = await ChatBot.LanguageModel.ChatStreamingAsync(thread, null, null, null, null, DestroyCancellationToken);
+        logger.LogInformation("日报LLM分析完成：回复 {Length} 字", reply.Length);
         ParseAnalysisReply(reply, result);
+        logger.LogInformation("日报解析结果：话题 {Topics} 个，金句 {Quotes} 个，锐评 {Comment} 字",
+            result.Topics.Count, result.Quotes.Count, result.Comment.Length);
         return result;
     }
 
@@ -883,12 +886,20 @@ public class GroupDailyReportModule(
         string imagePath = Path.Combine(reportDirectory, groupId + "_" + timestamp + ".png");
         await File.WriteAllTextAsync(htmlPath, html, Encoding.UTF8);
 
-        int estimatedHeight = 420
-            + analysis.Topics.Count * 78
-            + Math.Min(topUsers.Count, Configuration.TopUserCount) * 44
-            + analysis.Quotes.Count * 86
-            + 200;
-        string windowSize = "--window-size=760," + Math.Clamp(estimatedHeight, 800, 3000) + " ";
+        // 高度按文字换行逐段估算并放宽：无头截图只截视口，估矮了内容会被切掉
+        int estimatedHeight = 460;
+        foreach (ReportTopic topic in analysis.Topics)
+        {
+            estimatedHeight += 46 + (int)Math.Ceiling(topic.Summary.Length / 48.0) * 20;
+        }
+        estimatedHeight += Math.Min(topUsers.Count, Configuration.TopUserCount) * 44 + 60;
+        foreach (ReportQuote quote in analysis.Quotes)
+        {
+            estimatedHeight += 52 + (int)Math.Ceiling(quote.Text.Length / 38.0) * 21;
+        }
+        estimatedHeight += 90 + (int)Math.Ceiling(analysis.Comment.Length / 42.0) * 22;
+        estimatedHeight = (int)(estimatedHeight * 1.2) + 160;
+        string windowSize = "--window-size=760," + Math.Clamp(estimatedHeight, 1000, 6000) + " ";
         string pageUrl = new Uri(htmlPath).AbsoluteUri;
         // 独立 user-data-dir：避免 Edge/Chrome 因已有实例或策略拒绝无头启动
         string userDataDir = "--user-data-dir=\"" + Path.Combine(Path.GetTempPath(), "suran_daily_report_profile") + "\" ";

@@ -19,10 +19,11 @@ public static class ReportTemplate
 .theme-diamond { --bg:#2b2b2b; --card:#383838; --primary:#d4af37; --accent:#ffd700; --text:#f0f0f0; --soft:#9a9a8a; --line:#4a4a4a; }
 .theme-sky { --bg:#e8f4fd; --card:#f7fcff; --primary:#5db8ee; --accent:#1e90ff; --text:#2f5b7c; --soft:#8fb4cc; --line:#d0e8fa; }
 * { margin: 0; padding: 0; box-sizing: border-box; }
+html { background: var(--bg); }
 body {
     background: var(--bg); color: var(--text);
     font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
-    width: 720px; padding: 24px 20px;
+    width: 720px; min-height: 100vh; padding: 24px 20px;
 }
 .card {
     background: var(--card); border: 2px solid var(--line); border-radius: 16px;
