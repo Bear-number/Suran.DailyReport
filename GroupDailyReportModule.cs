@@ -1126,17 +1126,20 @@ public class GroupDailyReportModule(
             string initiator = topic.Uid > 0 && currentParticipants.TryGetValue(topic.Uid, out string? name) ? name : "";
             topicsBuilder.Append("<div class=\"topic\">")
                 .Append("<div class=\"topic-body\"><div class=\"t-name\">").Append(EscapeHtml(topic.Title))
-                .Append("</div><div class=\"t-sum\">").Append(EscapeHtml(topic.Summary));
-            if (initiator.Length > 0)
-            {
-                topicsBuilder.Append("<span class=\"t-starter\"> · 由 ").Append(EscapeHtml(initiator)).Append(" 引出</span>");
-            }
-            topicsBuilder.Append("</div>");
+                .Append("</div><div class=\"t-sum\">").Append(EscapeHtml(topic.Summary)).Append("</div>");
             if (topic.Comment.Length > 0)
             {
                 topicsBuilder.Append("<div class=\"t-cmt\">评：").Append(EscapeHtml(topic.Comment)).Append("</div>");
             }
-            topicsBuilder.Append("</div>").Append(AvatarMarkup(topicAvatar, initiator, "t-avatar")).Append("</div>");
+            topicsBuilder.Append("</div>");
+            if (initiator.Length > 0)
+            {
+                topicsBuilder.Append("<div class=\"t-initiator\">")
+                    .Append("<span class=\"t-starter\">由 ").Append(EscapeHtml(initiator)).Append(" 引出</span>")
+                    .Append(AvatarMarkup(topicAvatar, initiator, "t-avatar"))
+                    .Append("</div>");
+            }
+            topicsBuilder.Append("</div>");
         }
 
         StringBuilder usersBuilder = new();
