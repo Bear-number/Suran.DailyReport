@@ -1014,8 +1014,17 @@ public class GroupDailyReportModule(
             }
             if (screenshotReady)
             {
-                await SendReportImageAsync(groupId, imagePath);
-                return true;
+                try
+                {
+                    await SendReportImageAsync(groupId, imagePath);
+                    return true;
+                }
+                catch (Exception sendError)
+                {
+                    // 部分协议端对本地文件图片段支持不佳：转文字日报而不是整单失败
+                    logger.LogWarning("日报图片发送失败，转文字日报：{Message}", sendError.Message);
+                    return false;
+                }
             }
             lastError = "无头渲染未产出截图（进程退出后6秒内未出现文件）：" + (browserStdError.Length > 300 ? browserStdError[..300] : browserStdError);
             LogDetail(lastError);
