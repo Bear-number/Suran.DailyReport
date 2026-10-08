@@ -628,51 +628,74 @@ public class GroupDailyReportModule(
         }
     }
 
-    // 分页拉取群历史消息（最多 MaxMessages 条、时间窗口 AnalysisDays）
+    // 分页拉取群历史消息（最多 MaxMessages 条、时间窗口 AnalysisDays）。
+    // 兼容三种协议端差异：NapCat 用 message_seq 锚点、SnowLuma 用 message_id 锚点（两个都带上）、
+    // SnowLuma 历史消息可能缺 post_type/time 字段（缺时间不做出窗判定）。
     async Task<List<ChatMessageRecord>> CollectHistoryAsync(long groupId)
     {
         Dictionary<string, ChatMessageRecord> collected = new();
-        long? oldestSeq = null;
+        long? anchor = null;
         for (int page = 0; page < 25; page++)
         {
-            JsonObject parameters = new() { ["group_id"] = groupId };
-            if (oldestSeq.HasValue)
+            JsonObject parameters = new()
             {
-                parameters["message_seq"] = oldestSeq.Value;
+                ["group_id"] = groupId,
+                ["count"] = 100
+            };
+            if (anchor.HasValue)
+            {
+                parameters["message_seq"] = anchor.Value;
+                parameters["message_id"] = anchor.Value;
             }
             string response = await CallActionAsync("get_group_msg_history", parameters);
             JsonElement data = ParseActionResponse(response, "获取群消息历史");
-            if (data.ValueKind != JsonValueKind.Object || data.TryGetProperty("messages", out JsonElement messagesElement) == false
-                || messagesElement.ValueKind != JsonValueKind.Array)
+            List<JsonElement> pageMessages = new();
+            if (data.ValueKind == JsonValueKind.Object && data.TryGetProperty("messages", out JsonElement messagesElement)
+                && messagesElement.ValueKind == JsonValueKind.Array)
             {
-                break;
+                pageMessages = messagesElement.EnumerateArray().Select(item => item.Clone()).ToList();
             }
-            List<JsonElement> pageMessages = messagesElement.EnumerateArray().ToList();
+            else if (data.ValueKind == JsonValueKind.Array)
+            {
+                // SnowLuma 风格：data 直接是消息数组
+                pageMessages = data.EnumerateArray().Select(item => item.Clone()).ToList();
+            }
             if (pageMessages.Count == 0)
             {
                 break;
             }
 
-            long pageOldestSeq = long.MaxValue;
+            long pageOldestAnchor = long.MaxValue;
+            bool sawAnchorField = false;
             bool reachedWindowEnd = false;
             foreach (JsonElement item in pageMessages)
             {
-                long messageSeq = GetNumericField(item, "message_seq");
-                if (messageSeq > 0 && messageSeq < pageOldestSeq)
+                long seq = GetNumericField(item, "message_seq");
+                long messageId = GetNumericField(item, "message_id");
+                if (seq > 0 || messageId > 0)
                 {
-                    pageOldestSeq = messageSeq;
+                    sawAnchorField = true;
+                    long itemAnchor = Math.Min(seq > 0 ? seq : long.MaxValue, messageId > 0 ? messageId : long.MaxValue);
+                    if (itemAnchor < pageOldestAnchor)
+                    {
+                        pageOldestAnchor = itemAnchor;
+                    }
                 }
                 ChatMessageRecord? record = ToChatMessageRecord(item);
                 if (record == null)
                 {
                     continue;
                 }
-                DateTime messageTime = DateTimeOffset.FromUnixTimeSeconds(record.Time).LocalDateTime;
-                if (messageTime < DateTime.Now.AddDays(-Configuration.AnalysisDays))
+                if (record.Time > 0)
                 {
-                    reachedWindowEnd = true;
-                    continue;
+                    DateTime messageTime = DateTimeOffset.FromUnixTimeSeconds(record.Time).LocalDateTime;
+                    if (messageTime < DateTime.Now.AddDays(-Configuration.AnalysisDays))
+                    {
+                        reachedWindowEnd = true;
+                        continue;
+                    }
                 }
+                // 缺时间字段的消息也收录（部分协议端历史消息不带time）
                 collected[record.UserId + "_" + record.Time + "_" + record.Text.GetHashCode()] = record;
             }
 
@@ -680,16 +703,17 @@ public class GroupDailyReportModule(
             {
                 break;
             }
-            if (oldestSeq.HasValue && pageOldestSeq >= oldestSeq.Value)
+            if (sawAnchorField == false || pageOldestAnchor >= long.MaxValue)
+            {
+                // 协议端没返回锚点字段，无法继续翻页
+                break;
+            }
+            if (anchor.HasValue && pageOldestAnchor >= anchor.Value)
             {
                 // 没有更旧的消息了
                 break;
             }
-            oldestSeq = pageOldestSeq == long.MaxValue ? null : pageOldestSeq;
-            if (oldestSeq.HasValue == false)
-            {
-                break;
-            }
+            anchor = pageOldestAnchor;
         }
         return collected.Values
             .OrderByDescending(record => record.Time)
@@ -699,7 +723,9 @@ public class GroupDailyReportModule(
 
     ChatMessageRecord? ToChatMessageRecord(JsonElement item)
     {
-        if (GetStringField(item, "post_type") != "message")
+        // SnowLuma 等协议端的历史消息可能缺 post_type：只在明确非 message 时才跳过
+        string postType = GetStringField(item, "post_type");
+        if (postType.Length > 0 && postType != "message")
         {
             return null;
         }
