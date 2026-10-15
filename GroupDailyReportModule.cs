@@ -30,6 +30,10 @@ public class DailyReportConfig
     [Description("OneBot正向WebSocket地址，默认 ws://127.0.0.1:3001")]
     public string OneBotWsUrl { get; set; } = "ws://127.0.0.1:3001";
 
+    [DisplayName("基础·协议端类型")]
+    [Description("auto=自动识别（默认）/ napcat / llonebot / snowluma。影响历史消息翻页锚点：NapCat与LLOneBot只认message_seq，SnowLuma只认message_id，认不出时两种锚点都会试")]
+    public string ApiProvider { get; set; } = "auto";
+
     [DisplayName("基础·指定机器人昵称")]
     [Description("锐评署名，留空自动获取Bot昵称")]
     public string BotNickname { get; set; } = "";
@@ -139,6 +143,11 @@ public class GroupDailyReportModule(
 
     static bool receiveLoopStarted;
 
+    // ---- 协议端适配 ----
+    static string providerName = "";
+    static bool providerResolved;
+    static string historyAnchorField = "message_seq";
+
     // ---- 报告状态 ----
     readonly ConcurrentDictionary<long, byte> generatingGroups = new();
     readonly Dictionary<long, DateTime> lastReportTimes = new();
@@ -230,6 +239,8 @@ public class GroupDailyReportModule(
             sharedConnection = null;
             pendingResponses.Clear();
             receiveLoopStarted = false;
+            providerName = "";
+            providerResolved = false;
         }
         finally
         {
@@ -434,6 +445,12 @@ public class GroupDailyReportModule(
             string detail = root.TryGetProperty("message", out JsonElement messageElement) && messageElement.ValueKind == JsonValueKind.String
                 ? messageElement.GetString() ?? ""
                 : "未知错误";
+            // 1404 = 动作名在该协议端不存在，光给错误码用户无从判断是插件坏了还是协议端没这接口
+            if (retcode == 1404)
+            {
+                detail += "（" + (providerName.Length > 0 ? providerName : "该协议端")
+                    + " 未实现该接口，请检查协议端设置或更换支持的协议端）";
+            }
             throw new Exception(operationName + "失败：" + detail);
         }
         return root.TryGetProperty("data", out JsonElement dataElement) ? dataElement.Clone() : JsonDocument.Parse("null").RootElement.Clone();
@@ -559,11 +576,13 @@ public class GroupDailyReportModule(
         try
         {
             // 1. 拉取群聊历史
-            List<ChatMessageRecord> messages = await CollectHistoryAsync(groupId);
+            HistoryFetchResult fetch = await CollectHistoryAsync(groupId);
+            List<ChatMessageRecord> messages = fetch.Messages;
             if (messages.Count < Configuration.MinMessages)
             {
                 interactor.Poke("📊 群聊日报：最近 " + Configuration.AnalysisDays + " 天消息数 (" + messages.Count + ") 不足 "
-                    + Configuration.MinMessages + " 条，本次不生成");
+                    + Configuration.MinMessages + " 条，本次不生成"
+                    + (messages.Count == 0 ? "。拉取情况：" + fetch.Diagnosis : ""));
                 return;
             }
             LogDetail("拉取到 " + messages.Count + " 条消息，开始统计与分析");
@@ -628,62 +647,64 @@ public class GroupDailyReportModule(
         }
     }
 
-    // 分页拉取群历史消息（最多 MaxMessages 条、时间窗口 AnalysisDays）。
-    // 兼容三种协议端差异：NapCat 用 message_seq 锚点、SnowLuma 用 message_id 锚点（两个都带上）、
-    // SnowLuma 历史消息可能缺 post_type/time 字段（缺时间不做出窗判定）。
-    async Task<List<ChatMessageRecord>> CollectHistoryAsync(long groupId)
+    sealed class HistoryFetchResult
     {
+        public List<ChatMessageRecord> Messages { get; set; } = new();
+        public int RawItemCount { get; set; }
+        public int FilteredItemCount { get; set; }
+        public bool WindowCut { get; set; }
+        public string Diagnosis { get; set; } = "";
+    }
+
+    // 分页拉取群历史消息（最多 MaxMessages 条、时间窗口 AnalysisDays）。
+    // 三端的翻页锚点不是同一个字段：NapCat 与 LLOneBot 只读 message_seq，SnowLuma 只读 message_id，
+    // 且 SnowLuma 的 message_id 是带符号哈希（可为负、也不代表时间顺序）。
+    // 所以每页都用 message_seq 定位最旧的那条消息，再把这条消息自己的 seq 或 message_id 发出去当下一页锚点，
+    // 绝不能把两个字段的值混用——锚点发错字段不报错，协议端只回一个空列表，看起来就是“抓不到历史消息”。
+    async Task<HistoryFetchResult> CollectHistoryAsync(long groupId)
+    {
+        HistoryFetchResult result = new();
+        string anchorField = await ResolveHistoryAnchorFieldAsync();
         Dictionary<string, ChatMessageRecord> collected = new();
         long? anchor = null;
+        long? lastOldestSeq = null;
+        string firstRawSample = "";
+
         for (int page = 0; page < 25; page++)
         {
-            JsonObject parameters = new()
+            List<JsonElement> pageMessages = await FetchHistoryPageAsync(groupId, anchor, anchorField);
+
+            // 认不出协议端时锚点字段靠试：猜错不报错、只回空列表，所以换另一种锚点重试，
+            // 且必须真翻到更旧的消息才算猜对（历史见底时另一种锚点会回最新那一页，不能当成猜对）
+            if (pageMessages.Count == 0 && anchor.HasValue && IsAnchorPinned() == false)
             {
-                ["group_id"] = groupId,
-                ["count"] = 100
-            };
-            if (anchor.HasValue)
-            {
-                parameters["message_seq"] = anchor.Value;
-                parameters["message_id"] = anchor.Value;
-            }
-            string response = await CallActionAsync("get_group_msg_history", parameters);
-            JsonElement data = ParseActionResponse(response, "获取群消息历史");
-            List<JsonElement> pageMessages = new();
-            if (data.ValueKind == JsonValueKind.Object && data.TryGetProperty("messages", out JsonElement messagesElement)
-                && messagesElement.ValueKind == JsonValueKind.Array)
-            {
-                pageMessages = messagesElement.EnumerateArray().Select(item => item.Clone()).ToList();
-            }
-            else if (data.ValueKind == JsonValueKind.Array)
-            {
-                // SnowLuma 风格：data 直接是消息数组
-                pageMessages = data.EnumerateArray().Select(item => item.Clone()).ToList();
+                string alternate = anchorField == "message_seq" ? "message_id" : "message_seq";
+                List<JsonElement> retried = await FetchHistoryPageAsync(groupId, anchor, alternate);
+                if (retried.Count > 0 && TryFindOldest(retried, out long retriedOldest, out _)
+                    && (lastOldestSeq.HasValue == false || retriedOldest < lastOldestSeq.Value))
+                {
+                    anchorField = alternate;
+                    pageMessages = retried;
+                }
             }
             if (pageMessages.Count == 0)
             {
                 break;
             }
+            if (firstRawSample.Length == 0)
+            {
+                firstRawSample = pageMessages[0].GetRawText();
+            }
+            result.RawItemCount += pageMessages.Count;
 
-            long pageOldestAnchor = long.MaxValue;
-            bool sawAnchorField = false;
-            bool reachedWindowEnd = false;
+            bool hasOldest = TryFindOldest(pageMessages, out long oldestSeq, out long oldestMessageId);
+
             foreach (JsonElement item in pageMessages)
             {
-                long seq = GetNumericField(item, "message_seq");
-                long messageId = GetNumericField(item, "message_id");
-                if (seq > 0 || messageId > 0)
-                {
-                    sawAnchorField = true;
-                    long itemAnchor = Math.Min(seq > 0 ? seq : long.MaxValue, messageId > 0 ? messageId : long.MaxValue);
-                    if (itemAnchor < pageOldestAnchor)
-                    {
-                        pageOldestAnchor = itemAnchor;
-                    }
-                }
                 ChatMessageRecord? record = ToChatMessageRecord(item);
                 if (record == null)
                 {
+                    result.FilteredItemCount++;
                     continue;
                 }
                 if (record.Time > 0)
@@ -691,34 +712,158 @@ public class GroupDailyReportModule(
                     DateTime messageTime = DateTimeOffset.FromUnixTimeSeconds(record.Time).LocalDateTime;
                     if (messageTime < DateTime.Now.AddDays(-Configuration.AnalysisDays))
                     {
-                        reachedWindowEnd = true;
+                        result.WindowCut = true;
                         continue;
                     }
                 }
-                // 缺时间字段的消息也收录（部分协议端历史消息不带time）
+                // 三端源码核对过历史条目都带 time，真遇到缺时间字段的（段类型异常/未来版本）也不该整条丢掉，照收
                 collected[record.UserId + "_" + record.Time + "_" + record.Text.GetHashCode()] = record;
             }
 
-            if (collected.Count >= Configuration.MaxMessages || reachedWindowEnd)
+            if (collected.Count >= Configuration.MaxMessages || result.WindowCut)
             {
                 break;
             }
-            if (sawAnchorField == false || pageOldestAnchor >= long.MaxValue)
+            if (hasOldest == false)
             {
-                // 协议端没返回锚点字段，无法继续翻页
+                logger.LogWarning("[日报] 协议端历史消息里没有 message_seq，无法定位翻页锚点");
                 break;
             }
-            if (anchor.HasValue && pageOldestAnchor >= anchor.Value)
+            if (lastOldestSeq.HasValue && oldestSeq >= lastOldestSeq.Value)
             {
                 // 没有更旧的消息了
                 break;
             }
-            anchor = pageOldestAnchor;
+            lastOldestSeq = oldestSeq;
+            long nextAnchor = anchorField == "message_id" ? oldestMessageId : oldestSeq;
+            if (nextAnchor == 0)
+            {
+                logger.LogWarning("[日报] 最旧消息缺少 {Anchor} 字段，无法继续翻页", anchorField);
+                break;
+            }
+            anchor = nextAnchor;
         }
-        return collected.Values
+
+        result.Messages = collected.Values
             .OrderByDescending(record => record.Time)
             .Take(Configuration.MaxMessages)
             .ToList();
+
+        string providerLabel = providerName.Length > 0
+            ? providerName
+            : (IsAnchorPinned() ? Configuration.ApiProvider.Trim() : "未识别");
+        result.Diagnosis = "协议端 " + providerLabel + "，翻页锚点 " + anchorField
+            + "，原始条目 " + result.RawItemCount + " 条，结构不符被过滤 " + result.FilteredItemCount + " 条";
+        if (IsAnchorPinned() == false)
+        {
+            // 试探出来的锚点记下来，后续日报不用再每次白试一轮
+            historyAnchorField = anchorField;
+        }
+        if (result.Messages.Count == 0)
+        {
+            // 抓不到又不报错最难定位，判定依据直接写进普通日志，用户不用开详细日志也能回报
+            logger.LogInformation("[日报] 群 {GroupId} 未取到可用历史消息：{Diagnosis}", groupId, result.Diagnosis);
+            if (firstRawSample.Length > 0)
+            {
+                logger.LogInformation("[日报] 首条原始返回：{Sample}",
+                    firstRawSample.Length > 500 ? firstRawSample[..500] : firstRawSample);
+            }
+        }
+        return result;
+    }
+
+    async Task<List<JsonElement>> FetchHistoryPageAsync(long groupId, long? anchor, string anchorField)
+    {
+        JsonObject parameters = new()
+        {
+            ["group_id"] = groupId,
+            ["count"] = 100
+        };
+        if (anchor.HasValue)
+        {
+            parameters[anchorField] = anchor.Value;
+        }
+        string response = await CallActionAsync("get_group_msg_history", parameters);
+        JsonElement data = ParseActionResponse(response, "获取群消息历史");
+        if (data.ValueKind == JsonValueKind.Object
+            && data.TryGetProperty("messages", out JsonElement messagesElement)
+            && messagesElement.ValueKind == JsonValueKind.Array)
+        {
+            return messagesElement.EnumerateArray().Select(item => item.Clone()).ToList();
+        }
+        if (data.ValueKind == JsonValueKind.Array)
+        {
+            return data.EnumerateArray().Select(item => item.Clone()).ToList();
+        }
+        return new List<JsonElement>();
+    }
+
+    // 用 message_seq 定位本页最旧的消息，并取出这条消息自己的 message_id。
+    // 不能直接拿 message_id 比大小：SnowLuma 的 message_id 是带符号哈希，跟时间顺序无关。
+    static bool TryFindOldest(List<JsonElement> items, out long oldestSeq, out long oldestMessageId)
+    {
+        oldestSeq = 0;
+        oldestMessageId = 0;
+        bool found = false;
+        foreach (JsonElement item in items)
+        {
+            if (TryGetNumericField(item, "message_seq", out long itemSeq)
+                && (found == false || itemSeq < oldestSeq))
+            {
+                found = true;
+                oldestSeq = itemSeq;
+                TryGetNumericField(item, "message_id", out oldestMessageId);
+            }
+        }
+        return found;
+    }
+
+    // 历史翻页该发哪个锚点字段：配置写死的优先，其次按 get_version_info 认，都认不出先按 message_seq 试探
+    async Task<string> ResolveHistoryAnchorFieldAsync()
+    {
+        string configured = Configuration.ApiProvider.Trim().ToLowerInvariant();
+        if (configured != "auto" && configured.Length > 0)
+        {
+            return AnchorFieldOfProtocol(configured);
+        }
+        if (providerResolved == false)
+        {
+            providerResolved = true;
+            try
+            {
+                string response = await CallActionAsync("get_version_info", new JsonObject());
+                JsonElement data = ParseActionResponse(response, "获取协议端版本");
+                // 实测 LLOneBot 只回 app_name，go-cqhttp 系才回 name/vendor，两种都取
+                providerName = (GetStringField(data, "app_name") + " " + GetStringField(data, "name")
+                    + " " + GetStringField(data, "vendor")).Trim();
+                LogDetail("识别到协议端：" + providerName);
+            }
+            catch (Exception versionError)
+            {
+                LogDetail("识别协议端失败，翻页锚点改用试探：" + versionError.Message);
+            }
+        }
+        string detected = AnchorFieldOfProtocol(providerName.ToLowerInvariant());
+        return detected.Length > 0 ? detected : historyAnchorField;
+    }
+
+    static string AnchorFieldOfProtocol(string provider)
+    {
+        if (provider.Contains("snowluma") || provider.Contains("lagrange"))
+        {
+            return "message_id";
+        }
+        if (provider.Contains("napcat") || provider.Contains("llonebot"))
+        {
+            return "message_seq";
+        }
+        return "";
+    }
+
+    bool IsAnchorPinned()
+    {
+        string configured = Configuration.ApiProvider.Trim().ToLowerInvariant();
+        return configured != "auto" && configured.Length > 0;
     }
 
     ChatMessageRecord? ToChatMessageRecord(JsonElement item)
@@ -1059,12 +1204,31 @@ public class GroupDailyReportModule(
         return false;
     }
 
+    // 本地图片段三端支持度不一样：NapCat 与 LLOneBot 走 url→file 顺序（不给 url 时才读 file），
+    // SnowLuma 偏好在本地能直接加载的 file，但它对 Windows 盘符路径的解析没有公开保证。
+    // 所以 file:/// 失败时同一张图改走 base64://（三端都支持），再失败才降级成文字日报。
     async Task SendReportImageAsync(long groupId, string imagePath)
+    {
+        try
+        {
+            await SendImageSegmentAsync(groupId, "file:///" + imagePath.Replace('\\', '/'));
+            return;
+        }
+        catch (Exception fileError)
+        {
+            logger.LogInformation("[日报] 本地路径图片段未被 {Provider} 接受，改用 base64：{Message}",
+                providerName.Length > 0 ? providerName : "协议端", fileError.Message);
+        }
+        string base64Image = Convert.ToBase64String(File.ReadAllBytes(imagePath));
+        await SendImageSegmentAsync(groupId, "base64://" + base64Image);
+    }
+
+    async Task SendImageSegmentAsync(long groupId, string fileReference)
     {
         JsonObject imageSegment = new()
         {
             ["type"] = "image",
-            ["data"] = new JsonObject { ["file"] = "file:///" + imagePath.Replace('\\', '/') }
+            ["data"] = new JsonObject { ["file"] = fileReference }
         };
         JsonArray messageArray = new();
         messageArray.Add(imageSegment);
@@ -1500,19 +1664,30 @@ public class GroupDailyReportModule(
 
     static long GetNumericField(JsonElement element, string fieldName)
     {
+        if (TryGetNumericField(element, fieldName, out long value))
+        {
+            return value;
+        }
+        return 0;
+    }
+
+    // 翻页锚点必须区分“字段没有”和“字段是0/负数”：SnowLuma 的 message_id 是带符号哈希，负数是正常值
+    static bool TryGetNumericField(JsonElement element, string fieldName, out long value)
+    {
+        value = 0;
         if (element.ValueKind != JsonValueKind.Object)
         {
-            return 0;
+            return false;
         }
         if (element.TryGetProperty(fieldName, out JsonElement field) == false)
         {
-            return 0;
+            return false;
         }
         return field.ValueKind switch
         {
-            JsonValueKind.Number => field.GetInt64(),
-            JsonValueKind.String => long.TryParse(field.GetString(), out long parsed) ? parsed : 0,
-            _ => 0
+            JsonValueKind.Number => field.TryGetInt64(out value),
+            JsonValueKind.String => long.TryParse(field.GetString(), out value),
+            _ => false
         };
     }
 }
