@@ -442,9 +442,16 @@ public class GroupDailyReportModule(
         bool succeeded = status == "ok" || status == "async" || retcode == 0;
         if (succeeded == false)
         {
-            string detail = root.TryGetProperty("message", out JsonElement messageElement) && messageElement.ValueKind == JsonValueKind.String
-                ? messageElement.GetString() ?? ""
-                : "未知错误";
+            // SnowLuma 的失败包只填 wording（LLOneBot/NapCat 两个键都填同一个值），只读 message 在 SnowLuma 下永远是「未知错误」
+            string detail = GetStringField(root, "message");
+            if (detail.Length == 0)
+            {
+                detail = GetStringField(root, "wording");
+            }
+            if (detail.Length == 0)
+            {
+                detail = "未知错误";
+            }
             // 1404 = 动作名在该协议端不存在，光给错误码用户无从判断是插件坏了还是协议端没这接口
             if (retcode == 1404)
             {
@@ -652,6 +659,7 @@ public class GroupDailyReportModule(
         public List<ChatMessageRecord> Messages { get; set; } = new();
         public int RawItemCount { get; set; }
         public int FilteredItemCount { get; set; }
+        public int Pages { get; set; }
         public bool WindowCut { get; set; }
         public string Diagnosis { get; set; } = "";
     }
@@ -660,7 +668,8 @@ public class GroupDailyReportModule(
     // 三端的翻页锚点不是同一个字段：NapCat 与 LLOneBot 只读 message_seq，SnowLuma 只读 message_id，
     // 且 SnowLuma 的 message_id 是带符号哈希（可为负、也不代表时间顺序）。
     // 所以每页都用 message_seq 定位最旧的那条消息，再把这条消息自己的 seq 或 message_id 发出去当下一页锚点，
-    // 绝不能把两个字段的值混用——锚点发错字段不报错，协议端只回一个空列表，看起来就是“抓不到历史消息”。
+    // 绝不能把两个字段的值混用。发错字段不报错，但有两种完全不同的表现（都在 SnowLuma/LLOneBot 源码里核对过）：
+    // 认不出的锚点直接回空列表，被忽略的锚点回最新那一页——所以“空”和“没往更旧走”都得当成锚点失效。
     async Task<HistoryFetchResult> CollectHistoryAsync(long groupId)
     {
         HistoryFetchResult result = new();
@@ -668,36 +677,51 @@ public class GroupDailyReportModule(
         Dictionary<string, ChatMessageRecord> collected = new();
         long? anchor = null;
         long? lastOldestSeq = null;
+        long lastOldestMessageId = 0;
         string firstRawSample = "";
 
         for (int page = 0; page < 25; page++)
         {
             List<JsonElement> pageMessages = await FetchHistoryPageAsync(groupId, anchor, anchorField);
+            bool hasOldest = TryFindOldest(pageMessages, out long oldestSeq, out long oldestMessageId);
 
-            // 认不出协议端时锚点字段靠试：猜错不报错、只回空列表，所以换另一种锚点重试，
-            // 且必须真翻到更旧的消息才算猜对（历史见底时另一种锚点会回最新那一页，不能当成猜对）
-            if (pageMessages.Count == 0 && anchor.HasValue && IsAnchorPinned() == false)
+            // 翻不动的两种表现：回空列表，或最旧一条没比上一页更旧（等于又给了最新那一页）
+            bool anchorFailed = pageMessages.Count == 0
+                || (hasOldest && lastOldestSeq.HasValue && oldestSeq >= lastOldestSeq.Value);
+
+            // 认不出协议端时锚点字段靠试：换另一种字段，并用上一页最旧那条消息在该字段下的取值重发，
+            // 只有真翻到更旧的消息才算猜对（历史见底时另一种锚点会回最新那一页，不能当成猜对）
+            if (anchorFailed && anchor.HasValue && IsAnchorPinned() == false)
             {
                 string alternate = anchorField == "message_seq" ? "message_id" : "message_seq";
-                List<JsonElement> retried = await FetchHistoryPageAsync(groupId, anchor, alternate);
-                if (retried.Count > 0 && TryFindOldest(retried, out long retriedOldest, out _)
-                    && (lastOldestSeq.HasValue == false || retriedOldest < lastOldestSeq.Value))
+                long? alternateAnchor = alternate == "message_seq"
+                    ? lastOldestSeq
+                    : (lastOldestMessageId != 0 ? lastOldestMessageId : null);
+                if (alternateAnchor.HasValue)
                 {
-                    anchorField = alternate;
-                    pageMessages = retried;
+                    List<JsonElement> retried = await FetchHistoryPageAsync(groupId, alternateAnchor, alternate);
+                    if (retried.Count > 0 && TryFindOldest(retried, out long retriedOldest, out long retriedMessageId)
+                        && (lastOldestSeq.HasValue == false || retriedOldest < lastOldestSeq.Value))
+                    {
+                        anchorField = alternate;
+                        anchorFailed = false;
+                        pageMessages = retried;
+                        oldestSeq = retriedOldest;
+                        oldestMessageId = retriedMessageId;
+                        hasOldest = true;
+                    }
                 }
             }
-            if (pageMessages.Count == 0)
+            if (anchorFailed)
             {
                 break;
             }
+            result.Pages++;
             if (firstRawSample.Length == 0)
             {
                 firstRawSample = pageMessages[0].GetRawText();
             }
             result.RawItemCount += pageMessages.Count;
-
-            bool hasOldest = TryFindOldest(pageMessages, out long oldestSeq, out long oldestMessageId);
 
             foreach (JsonElement item in pageMessages)
             {
@@ -729,12 +753,8 @@ public class GroupDailyReportModule(
                 logger.LogWarning("[日报] 协议端历史消息里没有 message_seq，无法定位翻页锚点");
                 break;
             }
-            if (lastOldestSeq.HasValue && oldestSeq >= lastOldestSeq.Value)
-            {
-                // 没有更旧的消息了
-                break;
-            }
             lastOldestSeq = oldestSeq;
+            lastOldestMessageId = oldestMessageId;
             long nextAnchor = anchorField == "message_id" ? oldestMessageId : oldestSeq;
             if (nextAnchor == 0)
             {
@@ -753,10 +773,20 @@ public class GroupDailyReportModule(
             ? providerName
             : (IsAnchorPinned() ? Configuration.ApiProvider.Trim() : "未识别");
         result.Diagnosis = "协议端 " + providerLabel + "，翻页锚点 " + anchorField
-            + "，原始条目 " + result.RawItemCount + " 条，结构不符被过滤 " + result.FilteredItemCount + " 条";
-        if (IsAnchorPinned() == false)
+            + "，翻到 " + result.Pages + " 页，原始条目 " + result.RawItemCount + " 条，结构不符被过滤 " + result.FilteredItemCount + " 条";
+        if (result.Pages == 1 && result.WindowCut == false && anchor.HasValue)
         {
-            // 试探出来的锚点记下来，后续日报不用再每次白试一轮
+            // 只拿到最新一页时，说清是锚点没被接受还是历史本来就到底了，否则看起来和“抓不到”一样
+            result.Diagnosis += "，只翻到第一页（锚点没让协议端翻动）";
+        }
+        if (result.Pages == 0)
+        {
+            // 不带锚点的第一页就空，和翻页无关：SnowLuma 只认本地存过这个群的消息
+            result.Diagnosis += "，第一页（不带锚点）就空——协议端没有该群的任何历史";
+        }
+        if (IsAnchorPinned() == false && result.Pages > 1)
+        {
+            // 试探出来且真翻得动的锚点才记下来，只翻到一页说明还没试对，别把错的字段固定住
             historyAnchorField = anchorField;
         }
         if (result.Messages.Count == 0)
@@ -1241,8 +1271,8 @@ public class GroupDailyReportModule(
         ParseActionResponse(sendResponse, "发送日报图片");
     }
 
-    // 浏览器发现：注册表 App Paths（Windows 解析浏览器的标准途径）为主，常见安装路径兜底
-    static string? FindBrowserExecutable()
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    static string? FindBrowserFromRegistry()
     {
         string[] browserNames = new[] { "msedge.exe", "chrome.exe", "chromium.exe", "brave.exe" };
         foreach (string browserName in browserNames)
@@ -1272,6 +1302,20 @@ public class GroupDailyReportModule(
                         // 单个注册表位置读不到不影响其余探测
                     }
                 }
+            }
+        }
+        return null;
+    }
+
+    // 浏览器发现：注册表 App Paths（Windows 解析浏览器的标准途径）为主，常见安装路径兜底
+    static string? FindBrowserExecutable()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            string? registered = FindBrowserFromRegistry();
+            if (registered != null)
+            {
+                return registered;
             }
         }
 
