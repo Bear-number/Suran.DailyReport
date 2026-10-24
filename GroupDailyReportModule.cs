@@ -19,7 +19,10 @@ using Alife.Framework;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel.Agents;
 using ChatMessageContent = Microsoft.SemanticKernel.ChatMessageContent;
+// 宿主热编译会按平台注入 WINDOWS/ANDROID/LINUX 符号；注册表只在桌面 Windows 侧可用，Android 端连类型都引不到
+#if !ANDROID
 using Microsoft.Win32;
+#endif
 
 namespace Suran.DailyReport;
 
@@ -1271,6 +1274,7 @@ public class GroupDailyReportModule(
         ParseActionResponse(sendResponse, "发送日报图片");
     }
 
+#if !ANDROID
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     static string? FindBrowserFromRegistry()
     {
@@ -1306,10 +1310,12 @@ public class GroupDailyReportModule(
         }
         return null;
     }
+#endif
 
-    // 浏览器发现：注册表 App Paths（Windows 解析浏览器的标准途径）为主，常见安装路径兜底
+    // 浏览器发现：Windows 走注册表 App Paths（解析浏览器的标准途径）+ 常见安装路径兜底；其余平台只在 PATH 上找同名可执行文件
     static string? FindBrowserExecutable()
     {
+#if !ANDROID
         if (OperatingSystem.IsWindows())
         {
             string? registered = FindBrowserFromRegistry();
@@ -1317,6 +1323,27 @@ public class GroupDailyReportModule(
             {
                 return registered;
             }
+        }
+#endif
+
+        if (OperatingSystem.IsWindows() == false)
+        {
+            foreach (string name in new[] { "chrome", "chromium", "microsoft-edge", "brave" })
+            {
+                foreach (string directory in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
+                {
+                    if (directory.Trim().Length == 0)
+                    {
+                        continue;
+                    }
+                    string candidate = Path.Combine(directory.Trim(), name);
+                    if (File.Exists(candidate))
+                    {
+                        return candidate;
+                    }
+                }
+            }
+            return null;
         }
 
         string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);

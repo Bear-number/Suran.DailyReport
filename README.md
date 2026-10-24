@@ -4,7 +4,11 @@
 群聊日报，移植自 KiraAI 的 KiraAI_daily_report_plugin：从协议端拉取群聊记录做统计分析（消息总数/参与人数/最活跃时段/活跃用户 TOP），LLM 精选热门话题与金句并带角色人设锐评，渲染成 5 套主题的精美图片发回群里。
 
 ## 版本
-4.2.1（对应 Alife 客户端 4.2.x）
+5.0.0（对应 Alife 客户端 5.0.x；本机 5.0.2 在役客户端已热编译装载成功）
+
+## 5.0.0 的改动
+- 版本号对齐客户端主版本（官方约定：插件版本首位应与客户端一致，`PluginSystem.IsClientCompatible` 按主版本判定）
+- 浏览器发现的注册表分支包进 `#if !ANDROID`（5.0 热编译按平台注入 `WINDOWS/ANDROID/LINUX` 符号，Android 端引不到 `Microsoft.Win32.Registry` 这个类型）；非 Windows 改为在 PATH 上找 chrome/chromium/microsoft-edge/brave，找不到就报「请在配置里填浏览器路径」而不是抛平台异常
 
 ## 依赖
 - Alife.Function.FunctionCaller
