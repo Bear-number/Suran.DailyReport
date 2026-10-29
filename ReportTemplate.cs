@@ -19,11 +19,13 @@ public static class ReportTemplate
 .theme-diamond { --bg:#2b2b2b; --card:#383838; --primary:#d4af37; --accent:#ffd700; --text:#f0f0f0; --soft:#9a9a8a; --line:#4a4a4a; }
 .theme-sky { --bg:#e8f4fd; --card:#f7fcff; --primary:#5db8ee; --accent:#1e90ff; --text:#2f5b7c; --soft:#8fb4cc; --line:#d0e8fa; }
 * { margin: 0; padding: 0; box-sizing: border-box; }
-html { background: var(--bg); }
+/* 这里不能再给 html 设背景：主题变量挂在 body 的 class 上，html 用 :root 的暖黄底色会把
+   body 之外的整块画布染成暖黄（实测非暖黄主题时，body 右侧 40px 和文档下方都是暖黄）。
+   不设的话浏览器会把 body 的背景 propagation 到画布，整张图就是主题色。 */
 body {
     background: var(--bg); color: var(--text);
     font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
-    width: 720px; min-height: 100vh; padding: 24px 20px;
+    width: 720px; margin: 0 auto; padding: 24px 20px;
 }
 .card {
     background: var(--card); border: 2px solid var(--line); border-radius: 16px;
@@ -45,13 +47,16 @@ body {
 .t-starter { color: var(--primary); font-size: 12px; white-space: nowrap; }
 .topic .t-name { font-size: 15px; font-weight: 700; }
 .topic .t-sum { font-size: 12px; color: var(--soft); margin-top: 2px; line-height: 1.5; }
-.t-cmt { font-size: 12px; color: var(--accent); margin-top: 4px; }
+.t-cmt { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--accent); margin-top: 5px; }
+.t-cmt .c-face, .ph.c-face { width: 18px; height: 18px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }
+.ph.c-face { font-size: 10px; }
 .quote { display: flex; align-items: flex-start; gap: 10px; background: var(--bg); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; }
 .q-avatar, .ph.q-avatar { width: 34px; height: 34px; border-radius: 50%; object-fit: cover; flex-shrink: 0; margin-top: 2px; }
 .quote-body { flex: 1; min-width: 0; }
 .quote .q-text { font-size: 14px; font-weight: 600; line-height: 1.5; }
 .q-best { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 8px; background: var(--primary); color: #fff; font-size: 11px; font-weight: 700; vertical-align: middle; }
-.quote .q-meta { font-size: 12px; color: var(--soft); margin-top: 4px; }
+.q-who { margin-left: auto; align-self: center; font-size: 12px; color: var(--soft); white-space: nowrap; }
+.q-reason { font-size: 12px; color: var(--accent); margin-top: 5px; }
 .comment-row { display: flex; align-items: center; gap: 14px; }
 .c-avatar, .ph.c-avatar { width: 76px; height: 76px; border-radius: 14px; object-fit: cover; flex-shrink: 0; border: 3px solid var(--primary); }
 .comment { font-size: 14px; line-height: 1.7; }

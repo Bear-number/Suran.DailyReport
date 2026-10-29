@@ -3,6 +3,8 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -124,6 +126,14 @@ public class DailyReportConfig
     [DisplayName("输出·日报主题风格")]
     [Description("warm暖黄 / sakura樱花粉 / clover幸运草绿 / diamond钻石黑 / sky天空蓝 / random随机")]
     public string Theme { get; set; } = "warm";
+
+    [DisplayName("输出·裁掉图片底部空白")]
+    [Description("无头浏览器只能按窗口高度截图，估算富余会变成图底部的空白。开着会在截图后从下往上找到最后一行有内容的像素并裁掉多余部分；裁失败就用原图，不影响发送")]
+    public bool CropBottomBlank { get; set; } = true;
+
+    [DisplayName("输出·保留最近几份日报文件")]
+    [Description("每次生成都往存储目录写一份 .html 与 .png。这里是最多保留的「份数」（一份=同批的 html+png），超出的按时间老的删；0=不清理")]
+    public int ReportKeepCount { get; set; } = 30;
 }
 
 [Module("群聊日报",
@@ -184,6 +194,7 @@ public class GroupDailyReportModule(
         avatarDirectory = Path.Combine(AlifePath.StorageFolderPath, "DailyReport", "avatars");
         Directory.CreateDirectory(reportDirectory);
         Directory.CreateDirectory(avatarDirectory);
+        PruneReportFiles();
         cachedBotNickname = Configuration.BotNickname.Trim();
         StartReceiveLoop();
         logger.LogInformation("群聊日报插件已启动，输出格式 {Format}，主题 {Theme}",
@@ -1156,16 +1167,26 @@ public class GroupDailyReportModule(
         string imagePath = Path.Combine(reportDirectory, groupId + "_" + timestamp + ".png");
         await File.WriteAllTextAsync(htmlPath, html, Encoding.UTF8);
 
-        // 高度按文字换行逐段估算并放宽：无头截图只截视口，估矮了内容会被切掉
+        // 高度按文字换行逐段估算并放宽：无头截图只截视口，估矮了内容会被切掉；富余交给裁图，所以宁可估高
         int estimatedHeight = 460;
         foreach (ReportTopic topic in analysis.Topics)
         {
             estimatedHeight += 46 + (int)Math.Ceiling(topic.Summary.Length / 48.0) * 20;
+            if (topic.Comment.Length > 0)
+            {
+                estimatedHeight += (int)Math.Ceiling(topic.Comment.Length / 44.0) * 18 + 6;
+            }
         }
         estimatedHeight += Math.Min(topUsers.Count, Configuration.TopUserCount) * 44 + 60;
+        int quoteSlot = 0;
         foreach (ReportQuote quote in analysis.Quotes)
         {
+            quoteSlot++;
             estimatedHeight += 52 + (int)Math.Ceiling(quote.Text.Length / 38.0) * 21;
+            if (quoteSlot == 1 && quote.Reason.Length > 0)
+            {
+                estimatedHeight += (int)Math.Ceiling(quote.Reason.Length / 40.0) * 18 + 6;
+            }
         }
         estimatedHeight += 90 + (int)Math.Ceiling(analysis.Comment.Length / 42.0) * 22;
         estimatedHeight = (int)(estimatedHeight * 1.2) + 160;
@@ -1218,6 +1239,11 @@ public class GroupDailyReportModule(
             }
             if (screenshotReady)
             {
+                if (Configuration.CropBottomBlank)
+                {
+                    CropBottomBlank(imagePath);
+                }
+                PruneReportFiles();
                 try
                 {
                     await SendReportImageAsync(groupId, imagePath);
@@ -1235,6 +1261,114 @@ public class GroupDailyReportModule(
         }
         logger.LogWarning("日报渲染失败（浏览器: {Browser}）：{Error}", browserPath, lastError);
         return false;
+    }
+
+    // 无头浏览器只能按窗口高度截图，估算再准也总有富余，图底部就留一片空白。
+    // 裁法：从最后一行往上找第一条「横向不是纯色」的行，下面只留正文自带的下内边距。
+    // 为什么比的是这一行自己匀不匀、而不是跟左上角底色比：视口比文档高时文档下方画的是白，跟主题底色根本不是一回事。
+    // 裁失败（没有 GDI+、整张都是纯色等）就原样发出去，绝不为裁图把日报搞没了。
+    void CropBottomBlank(string imagePath)
+    {
+        int keepHeight = 0;
+        int originalHeight = 0;
+        string croppedPath = imagePath + ".crop";
+        try
+        {
+            // GDI+ 会锁住打开的图片文件，所以读完先关，再决定要不要覆盖
+            using (Bitmap bitmap = new(imagePath))
+            {
+                originalHeight = bitmap.Height;
+                int contentBottom = -1;
+                for (int y = bitmap.Height - 1; y >= 0; y--)
+                {
+                    if (RowHasContent(bitmap, y))
+                    {
+                        contentBottom = y;
+                        break;
+                    }
+                }
+                if (contentBottom < 0 || bitmap.Height - contentBottom <= 32)
+                {
+                    return;
+                }
+                keepHeight = Math.Clamp(contentBottom + 1 + 24, 200, bitmap.Height);
+                using Bitmap cropped = bitmap.Clone(new Rectangle(0, 0, bitmap.Width, keepHeight), bitmap.PixelFormat);
+                cropped.Save(croppedPath, ImageFormat.Png);
+            }
+            File.Move(croppedPath, imagePath, true);
+            LogDetail("日报图底部空白已裁掉 " + (originalHeight - keepHeight) + " px");
+        }
+        catch (Exception cropError)
+        {
+            try
+            {
+                if (File.Exists(croppedPath))
+                {
+                    File.Delete(croppedPath);
+                }
+            }
+            catch
+            {
+            }
+            logger.LogWarning("日报裁底部空白失败（用原图发送）：{Message}", cropError.Message);
+        }
+    }
+
+    // 这一行有没有内容：横向每隔 6 px 取样，看它跟行首差多少；容差 6 留给极淡的渐变与阴影
+    static bool RowHasContent(Bitmap bitmap, int y)
+    {
+        Color first = bitmap.GetPixel(0, y);
+        for (int x = 2; x < bitmap.Width; x += 6)
+        {
+            Color pixel = bitmap.GetPixel(x, y);
+            if (Math.Abs(pixel.R - first.R) > 6 || Math.Abs(pixel.G - first.G) > 6 || Math.Abs(pixel.B - first.B) > 6)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 每次生成都会留一份 html + png，从不清理会一直涨。按「份」删：同一时间戳的两个文件算一份。
+    void PruneReportFiles()
+    {
+        if (Configuration.ReportKeepCount <= 0 || reportDirectory.Length == 0)
+        {
+            return;
+        }
+        try
+        {
+            List<IGrouping<string, string>> batches = Directory.GetFiles(reportDirectory)
+                .Where(file => file.EndsWith(".png", StringComparison.OrdinalIgnoreCase)
+                    || file.EndsWith(".html", StringComparison.OrdinalIgnoreCase))
+                .GroupBy(Path.GetFileNameWithoutExtension)
+                .OrderByDescending(batch => batch.Max(File.GetLastWriteTimeUtc))
+                .ToList();
+            int removed = 0;
+            foreach (IGrouping<string, string> batch in batches.Skip(Configuration.ReportKeepCount))
+            {
+                foreach (string file in batch)
+                {
+                    try
+                    {
+                        File.Delete(file);
+                        removed++;
+                    }
+                    catch
+                    {
+                        // 协议端可能还攥着刚发出去的那张图，删不掉就下一轮再删
+                    }
+                }
+            }
+            if (removed > 0)
+            {
+                LogDetail("日报文件已清理 " + removed + " 个，保留最近 " + Configuration.ReportKeepCount + " 份");
+            }
+        }
+        catch (Exception pruneError)
+        {
+            logger.LogWarning("清理日报文件失败：{Message}", pruneError.Message);
+        }
     }
 
     // 本地图片段三端支持度不一样：NapCat 与 LLOneBot 走 url→file 顺序（不给 url 时才读 file），
@@ -1385,6 +1519,8 @@ public class GroupDailyReportModule(
             _ => "暖黄手账"
         };
 
+        // 话题的「评：」是机器人写的点评，要带机器人头像，所以机器人名与头像在拼话题前先取好
+        string botAvatar = await LoadBotAvatarDataUriAsync();
         StringBuilder topicsBuilder = new();
         if (analysis.Topics.Count == 0)
         {
@@ -1399,7 +1535,8 @@ public class GroupDailyReportModule(
                 .Append("</div><div class=\"t-sum\">").Append(EscapeHtml(topic.Summary)).Append("</div>");
             if (topic.Comment.Length > 0)
             {
-                topicsBuilder.Append("<div class=\"t-cmt\">评：").Append(EscapeHtml(topic.Comment)).Append("</div>");
+                topicsBuilder.Append("<div class=\"t-cmt\">").Append(AvatarMarkup(botAvatar, botName, "c-face"))
+                    .Append("<span>评：").Append(EscapeHtml(topic.Comment)).Append("</span></div>");
             }
             topicsBuilder.Append("</div>");
             if (initiator.Length > 0)
@@ -1441,18 +1578,24 @@ public class GroupDailyReportModule(
             {
                 quotesBuilder.Append("<span class=\"q-best\">今日最佳</span>");
             }
-            quotesBuilder.Append("</div><div class=\"q-meta\">—— ").Append(EscapeHtml(who));
-            if (quote.Reason.Length > 0)
+            quotesBuilder.Append("</div>");
+            if (quoteIndex == 1 && quote.Reason.Length > 0)
             {
-                quotesBuilder.Append(" · ").Append(EscapeHtml(quote.Reason));
+                // 今日最佳单独给一行点评，普通金句不带（带了会把版面挤乱）
+                quotesBuilder.Append("<div class=\"q-reason\">评：").Append(EscapeHtml(quote.Reason)).Append("</div>");
             }
-            quotesBuilder.Append("</div></div></div>");
+            quotesBuilder.Append("</div>");
+            // 谁说的挪到这一行的右边，跟话题卡「由 XX 引出」同一侧，读起来视线不用来回跳
+            if (who.Length > 0)
+            {
+                quotesBuilder.Append("<div class=\"q-who\">—— ").Append(EscapeHtml(who)).Append("</div>");
+            }
+            quotesBuilder.Append("</div>");
         }
 
         string dateRange = windowStart.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + " ~ "
             + windowEnd.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
         string groupAvatar = await LoadGroupAvatarDataUriAsync();
-        string botAvatar = await LoadBotAvatarDataUriAsync();
         string commentText = analysis.Comment.Length > 0 ? analysis.Comment : "今天大家聊得不错~";
 
         return ReportTemplate.Html
