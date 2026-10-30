@@ -25,7 +25,9 @@ public static class ReportTemplate
 body {
     background: var(--bg); color: var(--text);
     font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
-    width: 720px; margin: 0 auto; padding: 24px 20px;
+    /* 整张图统一放大字号：改一处 zoom 比逐条 px 靠谱（不会漏掉哪个角落）。
+       宽 610 × 1.18 ≈ 720，截图窗口仍是 760，横向不会溢出；行高、头像、间距一起跟着长。 */
+    width: 610px; margin: 0 auto; padding: 24px 20px; zoom: 1.18;
 }
 .card {
     background: var(--card); border: 2px solid var(--line); border-radius: 16px;
@@ -40,15 +42,17 @@ body {
 .stat .num { font-size: 22px; font-weight: 800; color: var(--primary); }
 .stat .label { font-size: 12px; color: var(--soft); margin-top: 4px; }
 .section-title { font-size: 16px; font-weight: 800; color: var(--accent); margin-bottom: 10px; }
-.topic { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; padding-left: 12px; border-left: 4px solid var(--primary); }
+/* flex-wrap：字号放大后长标题会把右侧「由 X 引出」整块挤出视口（实测第二条话题名字直接不见了），
+   放不下时让它换到下一行继续右对齐，名字永远看得见 */
+.topic { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; padding-left: 12px; border-left: 4px solid var(--primary); }
 .t-avatar, .ph.t-avatar { width: 38px; height: 38px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }
 .topic-body { flex: 1; min-width: 0; text-align: left; }
 .t-initiator { display: flex; align-items: center; gap: 6px; margin-left: auto; flex-shrink: 0; }
 .t-starter { color: var(--primary); font-size: 12px; white-space: nowrap; }
 .topic .t-name { font-size: 15px; font-weight: 700; }
 .topic .t-sum { font-size: 12px; color: var(--soft); margin-top: 2px; line-height: 1.5; }
-.t-cmt { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--accent); margin-top: 5px; }
-.t-cmt .c-face, .ph.c-face { width: 18px; height: 18px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }
+.t-cmt, .q-reason { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--accent); margin-top: 5px; }
+.t-cmt .c-face, .q-reason .c-face, .ph.c-face { width: 18px; height: 18px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }
 .ph.c-face { font-size: 10px; }
 .quote { display: flex; align-items: flex-start; gap: 10px; background: var(--bg); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; }
 .q-avatar, .ph.q-avatar { width: 34px; height: 34px; border-radius: 50%; object-fit: cover; flex-shrink: 0; margin-top: 2px; }
@@ -56,7 +60,6 @@ body {
 .quote .q-text { font-size: 14px; font-weight: 600; line-height: 1.5; }
 .q-best { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 8px; background: var(--primary); color: #fff; font-size: 11px; font-weight: 700; vertical-align: middle; }
 .q-who { margin-left: auto; align-self: center; font-size: 12px; color: var(--soft); white-space: nowrap; }
-.q-reason { font-size: 12px; color: var(--accent); margin-top: 5px; }
 .comment-row { display: flex; align-items: center; gap: 14px; }
 .c-avatar, .ph.c-avatar { width: 76px; height: 76px; border-radius: 14px; object-fit: cover; flex-shrink: 0; border: 3px solid var(--primary); }
 .comment { font-size: 14px; line-height: 1.7; }

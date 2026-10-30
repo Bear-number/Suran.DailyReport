@@ -163,12 +163,14 @@ public class GroupDailyReportModule(
 
     // ---- 报告状态 ----
     readonly ConcurrentDictionary<long, byte> generatingGroups = new();
-    readonly Dictionary<long, DateTime> lastReportTimes = new();
+    // 每群后台任务都会写这张表，普通 Dictionary 并发写会坏（甚至丢条目），和上面那个引出人的问题是同一类
+    readonly ConcurrentDictionary<long, DateTime> lastReportTimes = new();
     DateTime lastAutoFiredDate = DateTime.MinValue;
     string cachedBotNickname = "";
     long cachedBotId = 0;
     string personaStyle = "";
-    readonly Dictionary<long, string> currentParticipants = new();
+    // 每群一份的运行时数据（参与者表、群号）随 RunReportAsync 一路传参下去；
+    // 以前挂在实例上，定时多群并跑时后一个群一 Clear 就把前一个群正在用的表清了
 
     string reportDirectory = "";
     string avatarDirectory = "";
@@ -624,10 +626,10 @@ public class GroupDailyReportModule(
                 .Take(Configuration.TopUserCount)
                 .ToList();
             string activeRange = ComputeActiveWindow(messages);
-            currentParticipants.Clear();
+            Dictionary<long, string> userNames = new();
             foreach (ChatMessageRecord message in messages)
             {
-                currentParticipants.TryAdd(message.UserId, message.Nickname);
+                userNames.TryAdd(message.UserId, message.Nickname);
             }
 
             // 3. LLM 分析（话题/金句/锐评一次完成，回复自带当前人设）
@@ -645,7 +647,7 @@ public class GroupDailyReportModule(
             else
             {
                 bool imageSent = await RenderAndSendImageAsync(groupId, groupName, messages.Count, participants,
-                    activeRange, topUsers, analysis, botName, windowStart, windowEnd);
+                    activeRange, topUsers, analysis, botName, windowStart, windowEnd, userNames);
                 if (imageSent == false)
                 {
                     string textReport = BuildTextReport(groupName, messages.Count, participants, activeRange,
@@ -1149,7 +1151,7 @@ public class GroupDailyReportModule(
 
     async Task<bool> RenderAndSendImageAsync(long groupId, string groupName, int totalMessages, int participants,
         string activeRange, List<UserStat> topUsers, AnalysisResult analysis, string botName,
-        DateTime windowStart, DateTime windowEnd)
+        DateTime windowStart, DateTime windowEnd, Dictionary<long, string> userNames)
     {
         string? browserPath = FindBrowserExecutable();
         if (browserPath == null)
@@ -1158,37 +1160,37 @@ public class GroupDailyReportModule(
             return false;
         }
 
-        currentReportGroup = groupId;
         string theme = ResolveTheme();
         string html = await BuildHtml(groupName, totalMessages, participants, activeRange, topUsers, analysis, botName,
-            windowStart, windowEnd, theme);
+            windowStart, windowEnd, theme, groupId, userNames);
         string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
         string htmlPath = Path.Combine(reportDirectory, groupId + "_" + timestamp + ".html");
         string imagePath = Path.Combine(reportDirectory, groupId + "_" + timestamp + ".png");
         await File.WriteAllTextAsync(htmlPath, html, Encoding.UTF8);
 
-        // 高度按文字换行逐段估算并放宽：无头截图只截视口，估矮了内容会被切掉；富余交给裁图，所以宁可估高
-        int estimatedHeight = 460;
+        // 高度按文字换行逐段估算并放宽：无头截图只截视口，估矮了内容会被切掉；富余交给裁图，所以宁可估高。
+        // 模板整体 zoom 1.18（所有字号一起放大），故每行的字符数按变窄的逻辑行宽重算、每行高度乘回去
+        int estimatedHeight = 550;
         foreach (ReportTopic topic in analysis.Topics)
         {
-            estimatedHeight += 46 + (int)Math.Ceiling(topic.Summary.Length / 48.0) * 20;
+            estimatedHeight += 56 + (int)Math.Ceiling(topic.Summary.Length / 40.0) * 24;
             if (topic.Comment.Length > 0)
             {
-                estimatedHeight += (int)Math.Ceiling(topic.Comment.Length / 44.0) * 18 + 6;
+                estimatedHeight += (int)Math.Ceiling(topic.Comment.Length / 37.0) * 21 + 7;
             }
         }
-        estimatedHeight += Math.Min(topUsers.Count, Configuration.TopUserCount) * 44 + 60;
+        estimatedHeight += Math.Min(topUsers.Count, Configuration.TopUserCount) * 52 + 70;
         int quoteSlot = 0;
         foreach (ReportQuote quote in analysis.Quotes)
         {
             quoteSlot++;
-            estimatedHeight += 52 + (int)Math.Ceiling(quote.Text.Length / 38.0) * 21;
+            estimatedHeight += 62 + (int)Math.Ceiling(quote.Text.Length / 32.0) * 25;
             if (quoteSlot == 1 && quote.Reason.Length > 0)
             {
-                estimatedHeight += (int)Math.Ceiling(quote.Reason.Length / 40.0) * 18 + 6;
+                estimatedHeight += (int)Math.Ceiling(quote.Reason.Length / 34.0) * 21 + 7;
             }
         }
-        estimatedHeight += 90 + (int)Math.Ceiling(analysis.Comment.Length / 42.0) * 22;
+        estimatedHeight += 105 + (int)Math.Ceiling(analysis.Comment.Length / 35.0) * 26;
         estimatedHeight = (int)(estimatedHeight * 1.2) + 160;
         string windowSize = "--window-size=760," + Math.Clamp(estimatedHeight, 1000, 6000) + " ";
         string pageUrl = new Uri(htmlPath).AbsoluteUri;
@@ -1508,7 +1510,7 @@ public class GroupDailyReportModule(
 
     async Task<string> BuildHtml(string groupName, int totalMessages, int participants, string activeRange,
         List<UserStat> topUsers, AnalysisResult analysis, string botName,
-        DateTime windowStart, DateTime windowEnd, string theme)
+        DateTime windowStart, DateTime windowEnd, string theme, long groupId, Dictionary<long, string> userNames)
     {
         string themeName = theme switch
         {
@@ -1529,7 +1531,7 @@ public class GroupDailyReportModule(
         foreach (ReportTopic topic in analysis.Topics)
         {
             string topicAvatar = topic.Uid > 0 ? await LoadAvatarDataUriAsync(topic.Uid) : "";
-            string initiator = topic.Uid > 0 && currentParticipants.TryGetValue(topic.Uid, out string? name) ? name : "";
+            string initiator = topic.Uid > 0 && userNames.TryGetValue(topic.Uid, out string? name) ? name : "";
             topicsBuilder.Append("<div class=\"topic\">")
                 .Append("<div class=\"topic-body\"><div class=\"t-name\">").Append(EscapeHtml(topic.Title))
                 .Append("</div><div class=\"t-sum\">").Append(EscapeHtml(topic.Summary)).Append("</div>");
@@ -1571,7 +1573,7 @@ public class GroupDailyReportModule(
             quoteIndex++;
             string quoteAvatar = quote.Uid > 0 ? await LoadAvatarDataUriAsync(quote.Uid) : "";
             string who = quote.Who.Length > 0 ? quote.Who
-                : (quote.Uid > 0 && currentParticipants.TryGetValue(quote.Uid, out string? uname) ? uname : "");
+                : (quote.Uid > 0 && userNames.TryGetValue(quote.Uid, out string? uname) ? uname : "");
             quotesBuilder.Append("<div class=\"quote\">").Append(AvatarMarkup(quoteAvatar, who, "q-avatar"))
                 .Append("<div class=\"quote-body\"><div class=\"q-text\">「").Append(EscapeHtml(quote.Text)).Append("」");
             if (quoteIndex == 1)
@@ -1582,7 +1584,9 @@ public class GroupDailyReportModule(
             if (quoteIndex == 1 && quote.Reason.Length > 0)
             {
                 // 今日最佳单独给一行点评，普通金句不带（带了会把版面挤乱）
-                quotesBuilder.Append("<div class=\"q-reason\">评：").Append(EscapeHtml(quote.Reason)).Append("</div>");
+                // 今日最佳的点评也是机器人写的，跟话题那句「评：」一样带它的头像
+                quotesBuilder.Append("<div class=\"q-reason\">").Append(AvatarMarkup(botAvatar, botName, "c-face"))
+                    .Append("<span>评：").Append(EscapeHtml(quote.Reason)).Append("</span></div>");
             }
             quotesBuilder.Append("</div>");
             // 谁说的挪到这一行的右边，跟话题卡「由 XX 引出」同一侧，读起来视线不用来回跳
@@ -1595,7 +1599,7 @@ public class GroupDailyReportModule(
 
         string dateRange = windowStart.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + " ~ "
             + windowEnd.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-        string groupAvatar = await LoadGroupAvatarDataUriAsync();
+        string groupAvatar = await LoadGroupAvatarDataUriAsync(groupId);
         string commentText = analysis.Comment.Length > 0 ? analysis.Comment : "今天大家聊得不错~";
 
         return ReportTemplate.Html
@@ -1695,16 +1699,16 @@ public class GroupDailyReportModule(
         }
     }
 
-    async Task<string> LoadGroupAvatarDataUriAsync()
+    async Task<string> LoadGroupAvatarDataUriAsync(long groupId)
     {
         try
         {
-            string cachePath = Path.Combine(avatarDirectory, "group_" + currentReportGroup + ".png");
+            string cachePath = Path.Combine(avatarDirectory, "group_" + groupId + ".png");
             if (File.Exists(cachePath) == false
                 || (DateTime.Now - File.GetLastWriteTime(cachePath)).TotalDays > 3)
             {
                 using HttpResponseMessage avatarResponse = await sharedHttpClient.GetAsync(
-                    "https://p.qlogo.cn/gh/" + currentReportGroup + "/" + currentReportGroup + "/0/");
+                    "https://p.qlogo.cn/gh/" + groupId + "/" + groupId + "/0/");
                 avatarResponse.EnsureSuccessStatusCode();
                 byte[] imageBytes = await avatarResponse.Content.ReadAsByteArrayAsync();
                 File.WriteAllBytes(cachePath, imageBytes);
@@ -1717,7 +1721,6 @@ public class GroupDailyReportModule(
         }
     }
 
-    long currentReportGroup;
 
     async Task<string> GetGroupNameAsync(long groupId)
     {
