@@ -4,7 +4,12 @@
 群聊日报，移植自 KiraAI 的 KiraAI_daily_report_plugin：从协议端拉取群聊记录做统计分析（消息总数/参与人数/最活跃时段/活跃用户 TOP），LLM 精选热门话题与金句并带角色人设锐评，渲染成 5 套主题的精美图片发回群里。
 
 ## 版本
-5.1.1（对应 Alife 客户端 5.0.x；本机用系统 Chrome 无头实跑出图验证，见下）
+5.1.2（对应 Alife 客户端 5.0.x；本机用系统 Chrome 无头实跑出图验证，见下）
+
+## 5.1.2 的改动
+- **修：客户端 5.0 之后本插件编译不过**（`error CS1501: No overload for method 'ChatStreamingAsync' takes 6 arguments`）。宿主在 5.0 里把 `ILanguageModel.ChatStreamingAsync` 从 6 参数改成 4 参数，返回值也从 `string` 换成了 `ChatResult`：旧的 `(thread, textReceived, thinkReceived, tokenUsed, exceptionThrow, ct)` → 新的 `(thread, textReceived, thinkReceived, ct)`，`tokenUsed` 挪到 `ITokenUser.TokenUsed` 事件上报，`exceptionThrow` 回调取消
+- 日报的裸调改成取 `chatResult.AIMessage`，并把 `ChatResult.Exception` 抛回外层 `catch`，走原有的「❌ 日报生成失败：…」提示
+- **空回复也按失败处理**：新实现把模型异常装进 `ChatResult.Exception` 后正常 `return`，不再往外抛 —— 只改参数个数的话编译能过，但模型失败时会拿到空字符串，一路走进 `ParseAnalysisReply` 的兜底分支，最后发出去一张只有「今日群聊」四个字、没有内容的日报。现在这种情况直接报错，不静默出空报
 
 ## 5.1.1 的改动
 - 今日最佳那句「评：…」也带上机器人头像（和热门话题那句同一个 `c-face`、同一套 flex 样式）。真出图核对：body 里 `q-reason` 段内含 1 个头像位

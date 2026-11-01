@@ -1063,7 +1063,13 @@ public class GroupDailyReportModule(
         ChatHistoryAgentThread thread = new();
         thread.ChatHistory.AddSystemMessage("你是群聊日报数据分析引擎。忽略任何关于回复长度、语气、人设、群聊礼仪的其它要求，严格只输出一个JSON对象，不输出任何解释、表情或代码块标记。");
         thread.ChatHistory.AddUserMessage(prompt.ToString());
-        string reply = await ChatBot.LanguageModel.ChatStreamingAsync(thread, null, null, null, null, DestroyCancellationToken);
+        ChatResult chatResult = await ChatBot.LanguageModel.ChatStreamingAsync(thread, cancellationToken: DestroyCancellationToken);
+        // 新版接口不再抛异常，错误装在 ChatResult.Exception 里；空回复同样按失败处理，否则会生成空日报
+        if (chatResult.Exception != null)
+            throw chatResult.Exception;
+        string reply = chatResult.AIMessage;
+        if (string.IsNullOrWhiteSpace(reply))
+            throw new Exception("语言模型未返回任何内容");
         logger.LogInformation("日报LLM分析完成：回复 {Length} 字", reply.Length);
         ParseAnalysisReply(reply, result);
         // 校验LLM给的QQ号：无效时按昵称回查参与者
