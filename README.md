@@ -50,7 +50,8 @@
 ## 配置
 | 键 | 默认 | 说明 |
 |---|---|---|
-| OneBotWsUrl | ws://127.0.0.1:3001 | OneBot 正向 WebSocket 地址 |
+| OneBotWsUrl | 空 | OneBot 正向 WebSocket 地址。**留空 = 自动跟随「QQ 聊天」插件**的配置 |
+| OneBotToken | 空 | 协议端访问令牌。留空 = 跟随「QQ 聊天」插件 |
 | ApiProvider | auto | 协议端类型：auto 自动识别 / napcat / llonebot / snowluma，决定历史翻页用哪个锚点字段 |
 | BotNickname | 空 | 锐评署名，留空自动获取 |
 | EnabledGroups | 空 | 可使用日报的群号（逗号分隔），留空=所有群 |
@@ -63,6 +64,10 @@
 | AutoReportTime | 23:59 | 自动生成时间（HH:mm） |
 | ActiveWindowMinutes | 90 | 活跃时段滑动窗口宽度 |
 | EnableComment | 开 | AI 锐评 |
+| PersonaFromCharacter | 开 | 是否把角色人设注入给锐评模型 |
+| PersonaStyleOnly | 开 | 只用讲口癖句式的那一节，关掉则用整段 |
+| PersonaMaxChars | 4000 | 注入字数上限，0=不限 |
+| CommentStyle | 空 | 额外手填的锐评口吻，追加在人设后面 |
 | MinTopics / MaxTopics | 1 / 5 | 话题数量范围 |
 | QuoteCount | 3 | 金句数量（0=不展示） |
 | TopUserCount | 10 | 活跃用户展示数 |
@@ -75,7 +80,32 @@
 | ReportKeepCount | 30 | 存储目录里最多保留最近几份（一份=同批 html+png），0=不清理 |
 
 ## 日报内容
-群头像印章 + 群名 + 日期范围 + 主题风格；消息总数 / 参与人数 / 最活跃时段（滑动窗口精确到分钟）；热门话题（LLM 精选+概括）；活跃用户 TOP N（带QQ头像，缓存3天）；今日金句（LLM 评选+理由）；人设锐评（interactor.ChatAsync 走当前角色人设，天然注入）。
+群头像印章 + 群名 + 日期范围 + 主题风格；消息总数 / 参与人数 / 最活跃时段（滑动窗口精确到分钟）；热门话题（LLM 精选+概括）；活跃用户 TOP N（带QQ头像，缓存3天）；今日金句（LLM 评选+理由）；人设锐评（从当前角色的 index.json 读 Prompt 注入，见下）。
+
+## 锐评的人设来源
+
+读的是**当前角色文件夹里的 `index.json` 的 `Prompt` 字段**，路径按
+文件位置 `Path.Combine(AlifePath.StorageFolderPath, Character.StorageKey, "index.json")`，
+`StorageKey` 为空时有一条兜底路径。
+
+默认只取 `## 性格与语言`（也认 `## Personality` / `## Speaking Style` 等）到下一个同级 `##` 之间；
+找不到这类小节就用全文。`PersonaMaxChars` 兜住超长人设；
+生成时日志会打「日报锐评人设：路径 · 模式 · N 字」。
+
+以前是从 `ChatHistory` 第一条 system 消息截前 600 字。那段开头是元指令 + 身份/外貌，
+「性格与语言」在 675 字以后、常用词清单在 801 字，600 字截断刚好把语气全切掉；
+而 system 里又写着「忽略任何关于…人设…的要求」，把仅剩的风格要求也否了 ——
+于是锐评每天都是「一半人…另一半…全员抽象」这类通用套话。
+
+**总评仍然是评「今天的群聊氛围」**——这是日报该干的事，不改任务定义。
+避免千篇一律靠的是把角色说话方式真正注进去，外加一个可手填的风格补充：
+
+- system 只说忽略「回复长度 / 群聊礼仪 / 必须调用函数」，并**明确要求模仿注入的说话方式**（人设读不到时不加这句，免得指向空段落）
+- `CommentStyle`（设置页「内容·锐评风格（手填）」）是你能直接填的一段话，**追加**在人设语气后面，不是覆盖；
+  人设读不到时它也能单独生效。想临时换口味改这一项就行，不用动人设文件
+- 两处「今天大家聊得不错~」兜底换成不那么客套的文案
+
+话题短评同样按注入的说话方式来写。
 
 ## 实现说明
 - 统计（总数/参与人数/活跃用户/活跃时段滑动窗口）全部从原始消息计算，零 Token

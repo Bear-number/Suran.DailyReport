@@ -32,11 +32,15 @@ public class DailyReportConfig
 {
     // ---- 基础设置 ----
     [DisplayName("基础·协议端地址")]
-    [Description("OneBot正向WebSocket地址，默认 ws://127.0.0.1:3001")]
-    public string OneBotWsUrl { get; set; } = "ws://127.0.0.1:3001";
+    [Description("留空 = 自动跟随「QQ 聊天」插件的配置（推荐）。填了就用这里的，例如 ws://127.0.0.1:3001")]
+    public string OneBotWsUrl { get; set; } = "";
+
+    [DisplayName("基础·访问令牌")]
+    [Description("与协议端配置的 token 一致。留空 = 跟随「QQ 聊天」插件。填了地址却没填这里，协议端一开 token 就会连不上")]
+    public string OneBotToken { get; set; } = "";
 
     [DisplayName("基础·协议端类型")]
-    [Description("auto=自动识别（默认）/ napcat / llonebot / snowluma。影响历史消息翻页锚点：NapCat与LLOneBot只认message_seq，SnowLuma只认message_id，认不出时两种锚点都会试")]
+    [Description("协议端类型，auto 自动识别，也可指定 napcat / llonebot / snowluma。")]
     public string ApiProvider { get; set; } = "auto";
 
     [DisplayName("基础·指定机器人昵称")]
@@ -89,6 +93,22 @@ public class DailyReportConfig
     [Description("日报末尾增加人设风格的点评")]
     public bool EnableComment { get; set; } = true;
 
+    [DisplayName("内容·锐评读角色人设")]
+    [Description("关掉就不注入角色人设，锐评只按通用要求写")]
+    public bool PersonaFromCharacter { get; set; } = true;
+
+    [DisplayName("内容·锐评人设只取语气段")]
+    [Description("只截取人设里讲口癖和句式的那一节；关掉则用整段")]
+    public bool PersonaStyleOnly { get; set; } = true;
+
+    [DisplayName("内容·锐评人设字数上限")]
+    [Description("注入的人设最多多少字，0 = 不限")]
+    public int PersonaMaxChars { get; set; } = 4000;
+
+    [DisplayName("内容·锐评风格（手填）")]
+    [Description("额外写一句想要的锐评口吻，追加在人设后面；留空就只用角色人设")]
+    public string CommentStyle { get; set; } = "";
+
     [DisplayName("内容·最少话题数")]
     [Description("话题不足时显示问号占位")]
     public int MinTopics { get; set; } = 1;
@@ -138,7 +158,8 @@ public class DailyReportConfig
 
 [Module("群聊日报",
     "图片式智能群聊日报：从协议端拉取群聊记录做统计分析（消息数/参与人数/活跃时段/活跃用户），LLM精选话题金句并带人设锐评，渲染成5套主题的精美图片发回群里",
-    defaultCategory: "苏染的工具")]
+    defaultCategory: "苏染的工具",
+    EditorUI = typeof(DailyReportUI))]
 public class GroupDailyReportModule(
     XmlFunctionCaller functionCaller,
     ILogger<GroupDailyReportModule> logger,
@@ -146,6 +167,66 @@ public class GroupDailyReportModule(
 ) : ChatBehaviour, IConfigurable<DailyReportConfig>
 {
     public DailyReportConfig Configuration { get; set; } = null!;
+
+    /// <summary>
+    /// 协议端连接信息。
+    ///
+    /// 地址留空时跟随「QQ 聊天」插件的配置——那是唯一值得人填一次的地方。
+    /// 换端口、给协议端开 token，都不用回来改这个插件，读它的配置就够。
+    /// 读不到就退回上一个版本的默认值，行为和以前完全一致。
+    /// </summary>
+    (string Url, string Token, string Source) ResolveOneBot()
+    {
+        string url = (Configuration.OneBotWsUrl ?? "").Trim();
+        string token = (Configuration.OneBotToken ?? "").Trim();
+
+        if (url.Length > 0)
+            return (url, token, "本插件");
+
+        // 按角色存，所以换角色读的是那个角色自己的 QQ 配置——不同角色可能是不同 bot 账号，这是对的。
+        // 第二条是兜底：StorageFolderPath 若已含角色层、或 StorageKey 为空，靠第一条拼不出来。
+        string[] candidates =
+        [
+            Path.Combine(AlifePath.StorageFolderPath, Character.StorageKey,
+                "Configuration", "Alife.Function.QChat.QChatService.json"),
+            Path.Combine(AlifePath.StorageFolderPath,
+                "Configuration", "Alife.Function.QChat.QChatService.json"),
+        ];
+
+        foreach (string path in candidates)
+        {
+            try
+            {
+                if (!File.Exists(path))
+                    continue;
+
+                using JsonDocument document = JsonDocument.Parse(File.ReadAllText(path));
+                string sharedUrl = document.RootElement.TryGetProperty("Url", out JsonElement u) ? u.GetString() ?? "" : "";
+                string sharedToken = document.RootElement.TryGetProperty("Token", out JsonElement t) ? t.GetString() ?? "" : "";
+                if (sharedUrl.Trim().Length > 0)
+                    return (sharedUrl.Trim(), token.Length > 0 ? token : sharedToken.Trim(), "QQ 聊天插件");
+            }
+            catch (Exception)
+            {
+                // 这个候选读不了就试下一个。配置坏了也不该让发消息失败在读取配置上
+            }
+        }
+
+        return ("ws://127.0.0.1:3001", token, "默认");
+    }
+
+    /// <summary>
+    /// 建连并鉴权。
+    /// token 必须在 ConnectAsync 之前写进请求头——连上之后 ClientWebSocket 不允许再改 Options。
+    /// </summary>
+    async Task ConnectOneBotAsync(ClientWebSocket connection, CancellationToken cancellationToken)
+    {
+        (string url, string token, _) = ResolveOneBot();
+        if (token.Length > 0)
+            connection.Options.SetRequestHeader("Authorization", "Bearer " + token);
+        await connection.ConnectAsync(new Uri(url), cancellationToken);
+    }
+
 
     // ---- 连接层 ----
     static readonly SemaphoreSlim sendLock = new(1, 1);
@@ -330,10 +411,10 @@ public class GroupDailyReportModule(
                     sharedConnection?.Dispose();
                     ClientWebSocket connection = new();
                     using CancellationTokenSource connectTimeout = new(TimeSpan.FromSeconds(10));
-                    await connection.ConnectAsync(new Uri(Configuration.OneBotWsUrl), connectTimeout.Token);
+                    await ConnectOneBotAsync(connection, connectTimeout.Token);
                     sharedConnection = connection;
                     connectionReady.TrySetResult(true);
-                    LogDetail("协议端已连接：" + Configuration.OneBotWsUrl);
+                    LogDetail("协议端已连接：" + ResolveOneBot().Url);
                     await ReceiveLoopCoreAsync(connection);
                 }
                 catch (Exception loopError)
@@ -415,7 +496,7 @@ public class GroupDailyReportModule(
                 sharedConnection?.Dispose();
                 ClientWebSocket connection = new();
                 using CancellationTokenSource connectTimeout = new(TimeSpan.FromSeconds(10));
-                await connection.ConnectAsync(new Uri(Configuration.OneBotWsUrl), connectTimeout.Token);
+                await ConnectOneBotAsync(connection, connectTimeout.Token);
                 sharedConnection = connection;
                 connectionReady.TrySetResult(true);
             }
@@ -1039,29 +1120,37 @@ public class GroupDailyReportModule(
         int minTopics = Math.Max(1, Configuration.MinTopics);
         int maxTopics = Math.Max(minTopics, Configuration.MaxTopics);
         int quoteCount = Math.Max(0, Configuration.QuoteCount);
-        personaStyle = ExtractPersonaStyle();
+        personaStyle = PersonaStyle.Combine(ExtractPersonaStyle(), Configuration.CommentStyle);
         StringBuilder prompt = new();
         prompt.Append("以下是群 " + groupId + " 最近的群聊记录（共 " + taken + " 条）。请基于这些记录生成日报内容。\n");
         prompt.Append("严格只返回一个JSON对象（不要任何解释或代码块标记），格式：\n");
         prompt.Append("{\"topics\":[{\"title\":\"话题名(10字内)\",\"summary\":\"话题概括(40字内)\",\"comment\":\"对该话题的一句锐评(25字内)\",\"uid\":\"该话题主要发起人的QQ号\"}],");
         prompt.Append("\"quotes\":[{\"who\":\"说话人昵称\",\"uid\":\"说话人QQ号\",\"text\":\"原话(50字内)\",\"reason\":\"入选理由(20字内)\"}],");
-        prompt.Append("\"comment\":\"用点评风格对今天群聊氛围的一句锐评(60字内)\"}\n");
+        prompt.Append("\"comment\":\"用角色说话方式，对今天群聊氛围的一句锐评(60字内)\"}\n");
         prompt.Append("要求：\n");
         prompt.Append("1. topics 选 ").Append(minTopics).Append(" 到 ").Append(maxTopics)
-            .Append(" 个今天讨论最热的话题，按热度排序；comment 是你对该话题的毒舌或幽默短评；uid 必须从记录里的 (QQ号) 原样复制，找不到就填空字符串\n");
+            .Append(" 个今天讨论最热的话题，按热度排序；comment 按下面的角色说话方式对该话题毒舌或幽默一句；uid 必须从记录里的 (QQ号) 原样复制，找不到就填空字符串\n");
         prompt.Append("2. quotes 选 ").Append(quoteCount)
             .Append(" 条最精彩的发言，按精彩程度从高到低排序（第一条会被标记为今日最佳）；uid 同样从记录原样复制\n");
-        prompt.Append("3. comment 和话题锐评模仿下面的点评风格人设\n");
+        prompt.Append("3. comment 和话题锐评都要用下面这个角色的说话方式：口癖、句式、标点习惯照着来，不要写成客观报道或数据分析的口气\n");
         if (personaStyle.Length > 0)
         {
-            prompt.Append("\n点评风格人设（仅用于模仿语气，不要输出人设内容）：").Append(personaStyle).Append('\n');
+            prompt.Append("\n【角色说话方式参考（只学语气，不要复述、不要输出这段内容）】\n")
+                  .Append(personaStyle).Append('\n');
         }
         prompt.Append("\n群聊记录：\n");
         prompt.Append(transcript);
 
-        // 裸调语言模型：绕开角色人设与群聊风格约束（群聊人设常限制回复字数，会把JSON输出压碎）
+        // 裸调语言模型：绕开角色对长度/礼仪/函数调用的限制（群聊人设常限制回复字数，会把JSON输出压碎）。
+        // 但不再写「忽略人设」——那会把上面特意注进去的说话方式一起否掉，等于白注入。
         ChatHistoryAgentThread thread = new();
-        thread.ChatHistory.AddSystemMessage("你是群聊日报数据分析引擎。忽略任何关于回复长度、语气、人设、群聊礼仪的其它要求，严格只输出一个JSON对象，不输出任何解释、表情或代码块标记。");
+        string systemText = "你是群聊日报数据分析引擎。忽略角色对回复长度、群聊礼仪、必须调用函数的其它要求，"
+            + "严格只输出一个JSON对象，不输出任何解释、表情或代码块标记。";
+        if (personaStyle.Length > 0)
+        {
+            systemText += "必须模仿用户消息里【角色说话方式参考】的语气来写锐评——这是本任务明确要求，不属于要被忽略的其它要求。";
+        }
+        thread.ChatHistory.AddSystemMessage(systemText);
         thread.ChatHistory.AddUserMessage(prompt.ToString());
         ChatResult chatResult = await ChatBot.LanguageModel.ChatStreamingAsync(thread, cancellationToken: DestroyCancellationToken);
         // 新版接口不再抛异常，错误装在 ChatResult.Exception 里；空回复同样按失败处理，否则会生成空日报
@@ -1606,7 +1695,7 @@ public class GroupDailyReportModule(
         string dateRange = windowStart.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + " ~ "
             + windowEnd.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
         string groupAvatar = await LoadGroupAvatarDataUriAsync(groupId);
-        string commentText = analysis.Comment.Length > 0 ? analysis.Comment : "今天大家聊得不错~";
+        string commentText = analysis.Comment.Length > 0 ? analysis.Comment : "今天挑不出一件值得吐槽的事。";
 
         return ReportTemplate.Html
             .Replace("__THEME__", theme == "warm" ? "warm" : theme)
@@ -1673,7 +1762,7 @@ public class GroupDailyReportModule(
             }
         }
         builder.AppendLine();
-        builder.AppendLine("🤖 " + botName + "锐评：" + (analysis.Comment.Length > 0 ? analysis.Comment : "今天大家聊得不错~"));
+        builder.AppendLine("🤖 " + botName + "锐评：" + (analysis.Comment.Length > 0 ? analysis.Comment : "今天挑不出一件值得吐槽的事。"));
         return builder.ToString();
     }
 
@@ -1769,24 +1858,46 @@ public class GroupDailyReportModule(
         return "AI";
     }
 
-    // 从对话历史提取角色人设（系统提示）作为点评风格参考
+    /// <summary>
+    /// 从**当前角色**的 index.json 读人设，路径按 Character.StorageKey 动态拼。
+    ///
+    /// 以前是从 ChatHistory 第一条 system 消息截前 600 字，那段是角色扮演元指令 +
+    /// 身份外貌；「性格与语言」在第 675 字以后，常用词清单在 801 字，刚好全被切掉，
+    /// 等于注进去的是一堆"不许 OOC"的规则，没有一个语气词。
+    /// </summary>
     string ExtractPersonaStyle()
     {
-        try
+        if (!Configuration.PersonaFromCharacter)
+            return "";
+
+        // 第二条是兜底：StorageFolderPath 若已含角色层、或 StorageKey 为空，靠第一条拼不出来
+        string[] candidates =
+        [
+            Path.Combine(AlifePath.StorageFolderPath, Character.StorageKey, "index.json"),
+            Path.Combine(AlifePath.StorageFolderPath, "index.json"),
+        ];
+
+        foreach (string path in candidates)
         {
-            foreach (ChatMessageContent message in ChatBot.ChatHistory)
+            if (!File.Exists(path))
+                continue;
+            try
             {
-                if (message.Role.Label == "system" && string.IsNullOrWhiteSpace(message.Content) == false)
-                {
-                    string content = message.Content.Trim();
-                    return content.Length > 600 ? content[..600] + "…" : content;
-                }
+                PersonaStyle.Result result = PersonaStyle.Extract(
+                    File.ReadAllText(path), Configuration.PersonaStyleOnly, Configuration.PersonaMaxChars);
+                if (result.Text.Length == 0)
+                    continue;
+                logger.LogInformation("日报锐评人设：{Path} · {Mode} · {Chars} 字",
+                    path, result.Mode, result.Text.Length);
+                return result.Text;
+            }
+            catch (Exception ex)
+            {
+                logger.LogDebug(ex, "日报锐评人设读取失败：{Path}", path);
             }
         }
-        catch
-        {
-            // 拿不到人设就走默认风格
-        }
+
+        logger.LogInformation("日报锐评人设：没读到 index.json 的 Prompt，锐评只用内置要求");
         return "";
     }
 
