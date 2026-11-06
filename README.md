@@ -4,7 +4,13 @@
 群聊日报，移植自 KiraAI 的 KiraAI_daily_report_plugin：从协议端拉取群聊记录做统计分析（消息总数/参与人数/最活跃时段/活跃用户 TOP），LLM 精选热门话题与金句并带角色人设锐评，渲染成 5 套主题的精美图片发回群里。
 
 ## 版本
-5.1.2（对应 Alife 客户端 5.0.x；本机用系统 Chrome 无头实跑出图验证，见下）
+5.1.3（对应 Alife 客户端 5.0.x）
+
+## 5.1.3 的改动
+- **锐评注入角色人设**：生成时读当前角色 `index.json` 的 `Prompt`，默认只取「性格与语言」这一节，按她的口吻写话题短评与总评；读不到就用内置提示词
+- **新增「内容·锐评风格（手填）」**：填一句想要的锐评口吻，追加在角色人设之后；留空只用角色人设
+- **修：系统提示里原来写着「忽略任何关于人设的其它要求」**，与「模仿注入的说话方式」直接冲突，模型会把注入的语气当噪声丢掉
+- 兜底文案不再客套；配置说明只写功能本身，不再夹带实现原理
 
 ## 5.1.2 的改动
 - **修：客户端 5.0 之后本插件编译不过**（`error CS1501: No overload for method 'ChatStreamingAsync' takes 6 arguments`）。宿主在 5.0 里把 `ILanguageModel.ChatStreamingAsync` 从 6 参数改成 4 参数，返回值也从 `string` 换成了 `ChatResult`：旧的 `(thread, textReceived, thinkReceived, tokenUsed, exceptionThrow, ct)` → 新的 `(thread, textReceived, thinkReceived, ct)`，`tokenUsed` 挪到 `ITokenUser.TokenUsed` 事件上报，`exceptionThrow` 回调取消
