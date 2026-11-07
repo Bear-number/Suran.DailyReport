@@ -42,24 +42,28 @@ body {
 .stat .num { font-size: 22px; font-weight: 800; color: var(--primary); }
 .stat .label { font-size: 12px; color: var(--soft); margin-top: 4px; }
 .section-title { font-size: 16px; font-weight: 800; color: var(--accent); margin-bottom: 10px; }
-/* flex-wrap：字号放大后长标题会把右侧「由 X 引出」整块挤出视口（实测第二条话题名字直接不见了），
-   放不下时让它换到下一行继续右对齐，名字永远看得见 */
-.topic { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; padding-left: 12px; border-left: 4px solid var(--primary); }
-.t-avatar, .ph.t-avatar { width: 38px; height: 38px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }
-.topic-body { flex: 1; min-width: 0; text-align: left; }
+/* 话题卡：标题和「由 X 引出」同一行，摘要与点评独占整行。
+   摘要跟署名并排时会被压窄、换行难看，署名也会垂直居中插在摘要中间。 */
+.topic { display: block; margin-bottom: 16px; padding-left: 12px; border-left: 4px solid var(--primary); }
+.topic-body { min-width: 0; text-align: left; }
+.t-head { display: flex; align-items: center; gap: 8px; }
+.t-head .t-name { flex: 0 1 auto; min-width: 0; font-size: 15px; font-weight: 700; line-height: 1.4; }
 .t-initiator { display: flex; align-items: center; gap: 6px; margin-left: auto; flex-shrink: 0; }
 .t-starter { color: var(--primary); font-size: 12px; white-space: nowrap; }
-.topic .t-name { font-size: 15px; font-weight: 700; }
-.topic .t-sum { font-size: 12px; color: var(--soft); margin-top: 2px; line-height: 1.5; }
+.t-avatar, .ph.t-avatar { width: 24px; height: 24px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }
+.topic .t-sum { font-size: 12px; color: var(--soft); margin-top: 4px; line-height: 1.6; }
 .t-cmt, .q-reason { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--accent); margin-top: 5px; }
 .t-cmt .c-face, .q-reason .c-face, .ph.c-face { width: 18px; height: 18px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }
 .ph.c-face { font-size: 10px; }
-.quote { display: flex; align-items: flex-start; gap: 10px; background: var(--bg); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; }
+.quote { position: relative; display: flex; align-items: flex-start; gap: 10px; background: var(--bg); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; }
 .q-avatar, .ph.q-avatar { width: 34px; height: 34px; border-radius: 50%; object-fit: cover; flex-shrink: 0; margin-top: 2px; }
 .quote-body { flex: 1; min-width: 0; }
 .quote .q-text { font-size: 14px; font-weight: 600; line-height: 1.5; }
-.q-best { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 8px; background: var(--primary); color: #fff; font-size: 11px; font-weight: 700; vertical-align: middle; }
-.q-who { margin-left: auto; align-self: center; font-size: 12px; color: var(--soft); white-space: nowrap; }
+/* 「今日最佳」固定在卡片右上角，正文给它让出位置 */
+.q-best { position: absolute; top: 8px; right: 7px; padding: 1px 6px; border-radius: 7px; background: var(--primary); color: #fff; font-size: 10px; font-weight: 700; letter-spacing: 0; }
+.q-hot .q-text { padding-right: 44px; }
+/* 署名单独一行右对齐 */
+.q-who { margin-top: 5px; text-align: right; font-size: 12px; color: var(--soft); }
 .comment-row { display: flex; align-items: center; gap: 14px; }
 .c-avatar, .ph.c-avatar { width: 76px; height: 76px; border-radius: 14px; object-fit: cover; flex-shrink: 0; border: 3px solid var(--primary); }
 .comment { font-size: 14px; line-height: 1.7; }

@@ -244,12 +244,15 @@ public class GroupDailyReportModule(
 
     // ---- 报告状态 ----
     readonly ConcurrentDictionary<long, byte> generatingGroups = new();
+
+    // 多个群同时到点时排队跑：共用同一个模型实例，并发发起会互相挤，后面的容易写成敷衍的套话
+    readonly SemaphoreSlim reportGate = new(1, 1);
     // 每群后台任务都会写这张表，普通 Dictionary 并发写会坏（甚至丢条目），和上面那个引出人的问题是同一类
     readonly ConcurrentDictionary<long, DateTime> lastReportTimes = new();
     DateTime lastAutoFiredDate = DateTime.MinValue;
     string cachedBotNickname = "";
     long cachedBotId = 0;
-    string personaStyle = "";
+    // 人设文本按群现取现用，不再放字段：多群之间会互相覆盖
     // 每群一份的运行时数据（参与者表、群号）随 RunReportAsync 一路传参下去；
     // 以前挂在实例上，定时多群并跑时后一个群一 Clear 就把前一个群正在用的表清了
 
@@ -677,6 +680,7 @@ public class GroupDailyReportModule(
 
     async Task RunReportAsync(long groupId)
     {
+        await reportGate.WaitAsync(DestroyCancellationToken);
         try
         {
             // 1. 拉取群聊历史
@@ -748,6 +752,7 @@ public class GroupDailyReportModule(
         finally
         {
             generatingGroups.TryRemove(groupId, out _);
+            reportGate.Release();
         }
     }
 
@@ -1120,7 +1125,8 @@ public class GroupDailyReportModule(
         int minTopics = Math.Max(1, Configuration.MinTopics);
         int maxTopics = Math.Max(minTopics, Configuration.MaxTopics);
         int quoteCount = Math.Max(0, Configuration.QuoteCount);
-        personaStyle = PersonaStyle.Combine(ExtractPersonaStyle(), Configuration.CommentStyle);
+        string personaStyle = PersonaStyle.Combine(ExtractPersonaStyle(), Configuration.CommentStyle);
+        logger.LogInformation("[日报] 群 {Group} 注入人设 {Chars} 字", groupId, personaStyle.Length);
         StringBuilder prompt = new();
         prompt.Append("以下是群 " + groupId + " 最近的群聊记录（共 " + taken + " 条）。请基于这些记录生成日报内容。\n");
         prompt.Append("严格只返回一个JSON对象（不要任何解释或代码块标记），格式：\n");
@@ -1132,7 +1138,12 @@ public class GroupDailyReportModule(
             .Append(" 个今天讨论最热的话题，按热度排序；comment 按下面的角色说话方式对该话题毒舌或幽默一句；uid 必须从记录里的 (QQ号) 原样复制，找不到就填空字符串\n");
         prompt.Append("2. quotes 选 ").Append(quoteCount)
             .Append(" 条最精彩的发言，按精彩程度从高到低排序（第一条会被标记为今日最佳）；uid 同样从记录原样复制\n");
-        prompt.Append("3. comment 和话题锐评都要用下面这个角色的说话方式：口癖、句式、标点习惯照着来，不要写成客观报道或数据分析的口气\n");
+        prompt.Append("3. 总评、每条话题短评、金句的入选理由都要用下面这个角色的说话方式："
+            + "口癖、句式、标点习惯照着来，不要写成客观报道或数据分析的口气\n");
+        prompt.Append("4. comment 必须是一句连贯的话，不要把人分成几拨逐一交代——"
+            + "「一半人…另一半人…剩下的…」「有人…有人…」「一部分…还有一部分…」这类排比罗列一律不用；"
+            + "也别用「今天」「今晚」「今天群里」起头。挑群里最扎眼的那股劲儿，"
+            + "落到具体的词、事或画面上，一口气说完\n");
         if (personaStyle.Length > 0)
         {
             prompt.Append("\n【角色说话方式参考（只学语气，不要复述、不要输出这段内容）】\n")
@@ -1172,7 +1183,63 @@ public class GroupDailyReportModule(
         }
         logger.LogInformation("日报解析结果：话题 {Topics} 个，金句 {Quotes} 个，锐评 {Comment} 字",
             result.Topics.Count, result.Quotes.Count, result.Comment.Length);
+
+        if (ReportVoice.LooksTemplated(result.Comment))
+        {
+            string rewritten = await RewriteCommentAsync(result, personaStyle);
+            if (rewritten.Length > 0)
+            {
+                logger.LogInformation("日报锐评是分组罗列，已改写：{Before} → {After}", result.Comment, rewritten);
+                result.Comment = rewritten;
+            }
+            else
+            {
+                logger.LogWarning("日报锐评是分组罗列，改写没成功，保留原句：{Comment}", result.Comment);
+            }
+        }
         return result;
+    }
+
+    /// <summary>单独把总评重写一遍，话题与金句不动。失败回空串，调用方保留原句。</summary>
+    async Task<string> RewriteCommentAsync(AnalysisResult result, string personaStyle)
+    {
+        StringBuilder ask = new();
+        ask.Append("这句群聊日报的总评把群里的人分成了几拨逐一交代，读起来像模板：\n")
+            .Append(result.Comment).Append("\n\n");
+        ask.Append("改写成一句连贯的话（60 字内）：不要按「一半…另一半…」「有人…有人…」「一部分…还有一部分…」分组罗列，")
+            .Append("不要用「今天」「今晚」起头，挑群里最扎眼的那股劲儿，落到具体的词、事或画面上。\n");
+        if (result.Topics.Count > 0)
+        {
+            ask.Append("今天聊到的：")
+                .Append(string.Join("、", result.Topics.Select(topic => topic.Title)))
+                .Append('\n');
+        }
+        if (personaStyle.Length > 0)
+        {
+            ask.Append("【角色说话方式参考】\n").Append(personaStyle).Append('\n');
+        }
+        ask.Append("只输出改写后的一句话，不要解释，不要加引号。");
+
+        try
+        {
+            ChatHistoryAgentThread thread = new();
+            thread.ChatHistory.AddSystemMessage("你在改写一句群聊锐评。只输出改写结果本身，不加引号、不加解释。");
+            thread.ChatHistory.AddUserMessage(ask.ToString());
+            ChatResult chatResult = await ChatBot.LanguageModel.ChatStreamingAsync(
+                thread, cancellationToken: DestroyCancellationToken);
+            if (chatResult.Exception != null)
+                return "";
+            string text = (chatResult.AIMessage ?? "").Trim().Trim('"', '「', '」', '“', '”', '\u3000');
+            if (text.Length > 120)
+                text = text[..120];
+            // 改完还是分组罗列，就不替换，免得越改越差
+            return ReportVoice.LooksTemplated(text) ? "" : text;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "日报锐评改写失败，保留原句");
+            return "";
+        }
     }
 
     // LLM复制的QQ号无效时，按昵称回查参与者映射
@@ -1627,15 +1694,9 @@ public class GroupDailyReportModule(
         {
             string topicAvatar = topic.Uid > 0 ? await LoadAvatarDataUriAsync(topic.Uid) : "";
             string initiator = topic.Uid > 0 && userNames.TryGetValue(topic.Uid, out string? name) ? name : "";
-            topicsBuilder.Append("<div class=\"topic\">")
-                .Append("<div class=\"topic-body\"><div class=\"t-name\">").Append(EscapeHtml(topic.Title))
-                .Append("</div><div class=\"t-sum\">").Append(EscapeHtml(topic.Summary)).Append("</div>");
-            if (topic.Comment.Length > 0)
-            {
-                topicsBuilder.Append("<div class=\"t-cmt\">").Append(AvatarMarkup(botAvatar, botName, "c-face"))
-                    .Append("<span>评：").Append(EscapeHtml(topic.Comment)).Append("</span></div>");
-            }
-            topicsBuilder.Append("</div>");
+            // 标题和「由 X 引出」同一行，摘要与点评各占整行
+            topicsBuilder.Append("<div class=\"topic\"><div class=\"topic-body\"><div class=\"t-head\">")
+                .Append("<div class=\"t-name\">").Append(EscapeHtml(topic.Title)).Append("</div>");
             if (initiator.Length > 0)
             {
                 topicsBuilder.Append("<div class=\"t-initiator\">")
@@ -1643,7 +1704,14 @@ public class GroupDailyReportModule(
                     .Append(AvatarMarkup(topicAvatar, initiator, "t-avatar"))
                     .Append("</div>");
             }
-            topicsBuilder.Append("</div>");
+            topicsBuilder.Append("</div>")
+                .Append("<div class=\"t-sum\">").Append(EscapeHtml(topic.Summary)).Append("</div>");
+            if (topic.Comment.Length > 0)
+            {
+                topicsBuilder.Append("<div class=\"t-cmt\">").Append(AvatarMarkup(botAvatar, botName, "c-face"))
+                    .Append("<span>评：").Append(EscapeHtml(topic.Comment)).Append("</span></div>");
+            }
+            topicsBuilder.Append("</div></div>");
         }
 
         StringBuilder usersBuilder = new();
@@ -1669,13 +1737,9 @@ public class GroupDailyReportModule(
             string quoteAvatar = quote.Uid > 0 ? await LoadAvatarDataUriAsync(quote.Uid) : "";
             string who = quote.Who.Length > 0 ? quote.Who
                 : (quote.Uid > 0 && userNames.TryGetValue(quote.Uid, out string? uname) ? uname : "");
-            quotesBuilder.Append("<div class=\"quote\">").Append(AvatarMarkup(quoteAvatar, who, "q-avatar"))
-                .Append("<div class=\"quote-body\"><div class=\"q-text\">「").Append(EscapeHtml(quote.Text)).Append("」");
-            if (quoteIndex == 1)
-            {
-                quotesBuilder.Append("<span class=\"q-best\">今日最佳</span>");
-            }
-            quotesBuilder.Append("</div>");
+            quotesBuilder.Append(quoteIndex == 1 ? "<div class=\"quote q-hot\">" : "<div class=\"quote\">")
+                .Append(AvatarMarkup(quoteAvatar, who, "q-avatar"))
+                .Append("<div class=\"quote-body\"><div class=\"q-text\">「").Append(EscapeHtml(quote.Text)).Append("」</div>");
             if (quoteIndex == 1 && quote.Reason.Length > 0)
             {
                 // 今日最佳单独给一行点评，普通金句不带（带了会把版面挤乱）
@@ -1683,11 +1747,14 @@ public class GroupDailyReportModule(
                 quotesBuilder.Append("<div class=\"q-reason\">").Append(AvatarMarkup(botAvatar, botName, "c-face"))
                     .Append("<span>评：").Append(EscapeHtml(quote.Reason)).Append("</span></div>");
             }
-            quotesBuilder.Append("</div>");
-            // 谁说的挪到这一行的右边，跟话题卡「由 XX 引出」同一侧，读起来视线不用来回跳
             if (who.Length > 0)
             {
                 quotesBuilder.Append("<div class=\"q-who\">—— ").Append(EscapeHtml(who)).Append("</div>");
+            }
+            quotesBuilder.Append("</div>");
+            if (quoteIndex == 1)
+            {
+                quotesBuilder.Append("<span class=\"q-best\">今日最佳</span>");
             }
             quotesBuilder.Append("</div>");
         }
