@@ -13,6 +13,6 @@ public sealed class DailyReportUI : ModuleUIBase<GroupDailyReportModule, DailyRe
             b.AddContent(0, "配置未加载");
             return;
         }
-        SuranUiKit.Render(this, StateHasChanged, b, Configuration, "群聊日报", "拉群聊记录做统计，LLM 写人设锐评，渲染成主题图片发回群里", "#f59e0b");
+        SuranUiKit.Render(this, StateHasChanged, b, Configuration, "群聊日报", "拉群聊记录做统计，LLM 写人设锐评，渲染成主题图片发回群里");
     }
 }
