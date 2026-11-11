@@ -30,6 +30,10 @@ namespace Suran.DailyReport;
 
 public class DailyReportConfig
 {
+    [DisplayName("运行·功能文档常驻")]
+    [Description("开：功能说明常驻系统提示词，模型随时看得到工具；关：隐式加载省 token，模型先输出入口标签再读文档。日报多是主人明确要求或定时触发，默认关")]
+    public bool DocumentAlwaysResident { get; set; } = false;
+
     // ---- 基础设置 ----
     [DisplayName("基础·协议端地址")]
     [Description("留空 = 自动跟随「QQ 聊天」插件的配置（推荐）。填了就用这里的，例如 ws://127.0.0.1:3001")]
@@ -321,7 +325,9 @@ public class GroupDailyReportModule(
             Explanation = "用户说『总结一下今天的群聊』『生成日报』或发送『/日报』时调用 GenerateDailyReport。生成是异步的：先返回已开始，完成后日报自动发到群里。同一群有冷却时间（配置控制），消息太少会提示不足。"
                 + "只想看效果不发群用 daily_report_preview（返回图片/HTML 路径）；查定时与冷却用 daily_report_status；要重发先 daily_report_reset。"
         };
-        functionCaller.RegisterHandler(handler, DocumentMode.Implicit, cancellationToken: DestroyCancellationToken);
+        functionCaller.RegisterHandler(handler,
+            (Configuration?.DocumentAlwaysResident ?? false) ? DocumentMode.Explicit : DocumentMode.Implicit,
+            cancellationToken: DestroyCancellationToken);
         return Task.CompletedTask;
     }
 
