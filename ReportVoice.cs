@@ -14,7 +14,7 @@ public static class ReportVoice
     static readonly Regex AllNone = new(@"全员.{0,12}(无一人|没一个)", RegexOptions.Compiled);
 
     /// <summary>是不是分组罗列的模板写法。</summary>
-    public static bool LooksTemplated(string? comment)
+    public static bool LooksTemplated(string comment)
     {
         string text = (comment ?? "").Trim();
         if (text.Length == 0)
