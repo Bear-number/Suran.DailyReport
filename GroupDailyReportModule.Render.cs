@@ -281,53 +281,148 @@ public partial class GroupDailyReportModule
 
     void ParseAnalysisReply(string reply, AnalysisResult result)
     {
-        int jsonStart = reply.IndexOf('{');
-        int jsonEnd = reply.LastIndexOf('}');
-        if (jsonStart < 0 || jsonEnd <= jsonStart)
+        // 模型偶尔会套 ```json 围栏、多打一个 ] 或被截断，这里先按括号配对截出主体，
+        // 解析失败再跑一遍容错修复，避免一次手滑就整份日报作废。
+        string jsonText = SliceJsonObject(reply);
+        if (jsonText.Length == 0)
         {
             // 解析失败就报错：把整段回复当话题摘要发出去，只会得到一张写着 JSON 残片的日报
             throw new Exception("模型回复里没有可解析的 JSON（前 80 字：" + (reply.Length > 80 ? reply[..80] : reply) + "）");
         }
-        string jsonText = reply[jsonStart..(jsonEnd + 1)];
+
         try
         {
-            using JsonDocument parsed = JsonDocument.Parse(jsonText);
-            JsonElement root = parsed.RootElement.Clone();
-            int maxTopics = Math.Clamp(Configuration.MaxTopics, 0, 20);
-            int quoteCount = Math.Clamp(Configuration.QuoteCount, 0, 10);
-            if (root.TryGetProperty("topics", out JsonElement topicsElement) && topicsElement.ValueKind == JsonValueKind.Array)
-            {
-                foreach (JsonElement topic in topicsElement.EnumerateArray().Take(maxTopics))
-                {
-                    result.Topics.Add(new ReportTopic
-                    {
-                        Title = GetStringField(topic, "title"),
-                        Summary = GetStringField(topic, "summary"),
-                        Comment = GetStringField(topic, "comment"),
-                        Uid = GetNumericField(topic, "uid")
-                    });
-                }
-            }
-            if (root.TryGetProperty("quotes", out JsonElement quotesElement) && quotesElement.ValueKind == JsonValueKind.Array)
-            {
-                foreach (JsonElement quote in quotesElement.EnumerateArray().Take(quoteCount))
-                {
-                    result.Quotes.Add(new ReportQuote
-                    {
-                        Who = GetStringField(quote, "who"),
-                        Uid = GetNumericField(quote, "uid"),
-                        Text = GetStringField(quote, "text"),
-                        Reason = GetStringField(quote, "reason")
-                    });
-                }
-            }
-            result.Comment = GetStringField(root, "comment");
+            ApplyAnalysisJson(jsonText, result);
         }
-        catch (Exception parseError)
+        catch (Exception firstError)
         {
-            throw new Exception("模型返回的 JSON 解析失败：" + parseError.Message);
+            string repaired = RepairJson(jsonText);
+            if (string.Equals(repaired, jsonText, StringComparison.Ordinal))
+                throw new Exception("模型返回的 JSON 解析失败：" + firstError.Message);
+            try
+            {
+                ApplyAnalysisJson(repaired, result);
+            }
+            catch (Exception)
+            {
+                throw new Exception("模型返回的 JSON 解析失败：" + firstError.Message);
+            }
         }
 
+        FinalizeAnalysis(result);
+    }
+
+    /// <summary>把一份（已确认可解析的）JSON 填进结果对象。</summary>
+    void ApplyAnalysisJson(string jsonText, AnalysisResult result)
+    {
+        using JsonDocument parsed = JsonDocument.Parse(jsonText);
+        JsonElement root = parsed.RootElement.Clone();
+        int maxTopics = Math.Clamp(Configuration.MaxTopics, 0, 20);
+        int quoteCount = Math.Clamp(Configuration.QuoteCount, 0, 10);
+        if (root.TryGetProperty("topics", out JsonElement topicsElement) && topicsElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (JsonElement topic in topicsElement.EnumerateArray().Take(maxTopics))
+            {
+                result.Topics.Add(new ReportTopic
+                {
+                    Title = GetStringField(topic, "title"),
+                    Summary = GetStringField(topic, "summary"),
+                    Comment = GetStringField(topic, "comment"),
+                    Uid = GetNumericField(topic, "uid")
+                });
+            }
+        }
+        if (root.TryGetProperty("quotes", out JsonElement quotesElement) && quotesElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (JsonElement quote in quotesElement.EnumerateArray().Take(quoteCount))
+            {
+                result.Quotes.Add(new ReportQuote
+                {
+                    Who = GetStringField(quote, "who"),
+                    Uid = GetNumericField(quote, "uid"),
+                    Text = GetStringField(quote, "text"),
+                    Reason = GetStringField(quote, "reason")
+                });
+            }
+        }
+        result.Comment = GetStringField(root, "comment");
+    }
+
+    /// <summary>去掉 ```json 围栏，从第一个 { 截到与它配对的 }（字符串里的括号不算）。</summary>
+    static string SliceJsonObject(string reply)
+    {
+        string text = (reply ?? "").Replace("```json", "").Replace("```JSON", "").Replace("```", "");
+        int start = text.IndexOf('{');
+        if (start < 0)
+            return "";
+
+        bool inString = false, escape = false;
+        int depth = 0;
+        for (int i = start; i < text.Length; i++)
+        {
+            char c = text[i];
+            if (inString)
+            {
+                if (escape) escape = false;
+                else if (c == '\\') escape = true;
+                else if (c == '"') inString = false;
+                continue;
+            }
+            if (c == '"') { inString = true; continue; }
+            if (c == '{' || c == '[') depth++;
+            else if (c == '}' || c == ']')
+            {
+                depth--;
+                if (depth == 0)
+                    return text[start..(i + 1)];
+            }
+        }
+        // 没闭合（被截断）：返回剩余部分，交给 RepairJson 补
+        return text[start..];
+    }
+
+    /// <summary>
+    /// 容错修复：丢掉多余的右括号、把字符串里的裸换行压成空格、补齐未闭合的引号与括号。
+    /// 只处理"模型手滑"这一档，不做字段级猜测。
+    /// </summary>
+    static string RepairJson(string text)
+    {
+        StringBuilder sb = new(text.Length + 16);
+        Stack<char> stack = new();
+        bool inString = false, escape = false;
+        foreach (char c in text)
+        {
+            if (inString)
+            {
+                if (escape) { sb.Append(c); escape = false; }
+                else if (c == '\\') { sb.Append(c); escape = true; }
+                else if (c == '"') { sb.Append(c); inString = false; }
+                else if (c == '\n' || c == '\r') sb.Append(' ');
+                else sb.Append(c);
+                continue;
+            }
+            if (c == '"') { inString = true; sb.Append(c); continue; }
+            if (c == '{' || c == '[') { stack.Push(c); sb.Append(c); continue; }
+            if (c == '}' || c == ']')
+            {
+                char want = c == '}' ? '{' : '[';
+                // 和栈顶不配对就丢掉（典型：多打了一个 ]）
+                if (stack.Count > 0 && stack.Peek() == want) { stack.Pop(); sb.Append(c); }
+                continue;
+            }
+            if (c == '\n' || c == '\r' || c == '\t') { sb.Append(' '); continue; }
+            sb.Append(c);
+        }
+        if (inString) sb.Append('"');
+        while (stack.Count > 0) sb.Append(stack.Pop() == '{' ? '}' : ']');
+
+        // 末尾多余的逗号：{"a":1,} / [1,]
+        return System.Text.RegularExpressions.Regex.Replace(sb.ToString(), @",\s*([}\]])", "$1");
+    }
+
+    /// <summary>解析成功后的字段兜底：去空条目、统一去空白；全空时明确报错。</summary>
+    void FinalizeAnalysis(AnalysisResult result)
+    {
         // 字段级兜底：去掉空条目、统一去空白；全空时明确报错，不发一张只有占位符的日报
         foreach (ReportTopic topic in result.Topics)
         {
