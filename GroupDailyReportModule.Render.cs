@@ -754,6 +754,17 @@ public partial class GroupDailyReportModule
             logger.LogInformation("[日报] 本地路径图片段未被 {Provider} 接受，改用 base64：{Message}",
                 providerName.Length > 0 ? providerName : "协议端", fileError.Message);
         }
+        // 兜底才走 base64：先卡住大小，异常大的图读进内存会翻好几倍
+        FileInfo imageFile = new(imagePath);
+        if (!imageFile.Exists)
+        {
+            throw new FileNotFoundException("日报图不存在，无法 base64 发送", imagePath);
+        }
+        if (imageFile.Length > 8L * 1024 * 1024)
+        {
+            throw new InvalidOperationException("日报图超过 8MB（" + (imageFile.Length / 1024 / 1024)
+                + "MB），不走 base64；检查协议端的本地路径支持");
+        }
         string base64Image = Convert.ToBase64String(File.ReadAllBytes(imagePath));
         await SendImageSegmentAsync(groupId, "base64://" + base64Image);
     }
