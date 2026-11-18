@@ -216,37 +216,61 @@ public partial class GroupDailyReportModule(
         if (url.Length > 0)
             return (url, token, "本插件");
 
-        // 按角色存，所以换角色读的是那个角色自己的 QQ 配置——不同角色可能是不同 bot 账号，这是对的。
-        // 第二条是兜底：StorageFolderPath 若已含角色层、或 StorageKey 为空，靠第一条拼不出来。
-        string[] candidates =
+        // 按角色存，换角色读的是那个角色自己的 QQ 配置——不同角色可能是不同 bot 账号，这是对的。
+        // 先认 Suran.QChat（新结构 Accounts[0]，兼容老结构），没有再认官方 Alife.Function.QChat（老结构）。
+        // 每条配置都拼角色层和全局层两个候选：StorageFolderPath 已含角色层或 StorageKey 为空时靠全局兜底。
+        string[] fileNames =
         [
-            Path.Combine(AlifePath.StorageFolderPath, Character.StorageKey,
-                "Configuration", "Alife.Function.QChat.QChatService.json"),
-            Path.Combine(AlifePath.StorageFolderPath,
-                "Configuration", "Alife.Function.QChat.QChatService.json"),
+            "Suran.QChat.QChatService.json",
+            "Alife.Function.QChat.QChatService.json",
         ];
 
-        foreach (string path in candidates)
+        foreach (string fileName in fileNames)
         {
-            try
-            {
-                if (!File.Exists(path))
-                    continue;
+            string[] candidates =
+            [
+                Path.Combine(AlifePath.StorageFolderPath, Character.StorageKey, "Configuration", fileName),
+                Path.Combine(AlifePath.StorageFolderPath, "Configuration", fileName),
+            ];
 
-                using JsonDocument document = JsonDocument.Parse(File.ReadAllText(path));
-                string sharedUrl = document.RootElement.TryGetProperty("Url", out JsonElement u) ? u.GetString() ?? "" : "";
-                string sharedToken = document.RootElement.TryGetProperty("Token", out JsonElement t) ? t.GetString() ?? "" : "";
-                if (sharedUrl.Trim().Length > 0)
-                    return (sharedUrl.Trim(), token.Length > 0 ? token : sharedToken.Trim(), "QQ 聊天插件");
-            }
-            catch (Exception)
+            foreach (string path in candidates)
             {
-                // 这个候选读不了就试下一个。配置坏了也不该让发消息失败在读取配置上
+                try
+                {
+                    if (!File.Exists(path))
+                        continue;
+
+                    using JsonDocument document = JsonDocument.Parse(File.ReadAllText(path));
+                    JsonElement root = document.RootElement;
+                    JsonElement account = default;
+                    if (root.TryGetProperty("Accounts", out JsonElement accounts)
+                        && accounts.ValueKind == JsonValueKind.Array && accounts.GetArrayLength() > 0)
+                        account = accounts[0];
+
+                    string sharedUrl = ReadText(account, "Url");
+                    string sharedToken = ReadText(account, "Token");
+                    if (sharedUrl.Length == 0)
+                    {
+                        sharedUrl = ReadText(root, "Url");
+                        sharedToken = ReadText(root, "Token");
+                    }
+                    if (sharedUrl.Length > 0)
+                        return (sharedUrl, token.Length > 0 ? token : sharedToken, "QQ 聊天插件");
+                }
+                catch (Exception)
+                {
+                    // 这个候选读不了就试下一个。配置坏了也不该让发消息失败在读取配置上
+                }
             }
         }
 
         return ("ws://127.0.0.1:3001", token, "默认");
     }
+
+    static string ReadText(JsonElement element, string name) =>
+        element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out JsonElement value)
+            ? (value.GetString() ?? "").Trim()
+            : "";
 
     /// <summary>
     /// 建连并鉴权。
@@ -733,6 +757,11 @@ public partial class GroupDailyReportModule(
 
     async Task<string> CallActionAsync(string action, JsonObject parameters)
     {
+        // 装了 Suran.QChat 就共用它的连接；没装/没启用才用下面的独立连接
+        object? sharedClient = ChatActivity == null ? null : SharedQChatBridge.FindClient(ChatActivity);
+        if (sharedClient != null)
+            return await SharedQChatBridge.CallRawAsync(sharedClient, action, parameters);
+
         await connectionReady.Task.WaitAsync(TimeSpan.FromSeconds(15));
         string echo = Guid.NewGuid().ToString("N");
         TaskCompletionSource<string> waiter = new(TaskCreationOptions.RunContinuationsAsynchronously);
