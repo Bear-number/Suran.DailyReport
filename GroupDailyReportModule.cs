@@ -31,7 +31,7 @@ namespace Suran.DailyReport;
 public class DailyReportConfig
 {
     [DisplayName("运行·功能文档常驻")]
-    [Description("开：功能说明常驻系统提示词，模型随时看得到工具；关：隐式加载省 token，模型先输出入口标签再读文档。日报多是主人明确要求或定时触发，默认关")]
+    [Description("开：功能说明常驻系统提示词，模型随时看得到工具；关：隐式加载省 token，模型先输出入口标签再读文档。日报多是用户明确要求或定时触发，默认关")]
     public bool DocumentAlwaysResident { get; set; } = false;
 
     // ---- 基础设置 ----
@@ -345,7 +345,7 @@ public partial class GroupDailyReportModule(
     {
         XmlHandler handler = new(this)
         {
-            Description = "生成群聊日报：统计群聊消息（总数/参与人数/活跃时段/活跃用户），LLM精选热门话题与金句，并用人设风格锐评，渲染成精美图片发回群里。",
+            Description = "要出群聊日报时用：统计消息总数、参与人数、活跃时段和活跃用户，挑热门话题与金句，按人设锐评，发成图到群里。",
             Explanation = "用户说『总结一下今天的群聊』『生成日报』或发送『/日报』时调用 GenerateDailyReport。生成是异步的：先返回已开始，完成后日报自动发到群里。同一群有冷却时间（配置控制），消息太少会提示不足。"
                 + "只想看效果不发群用 daily_report_preview（返回图片/HTML 路径）；查定时与冷却用 daily_report_status；要重发先 daily_report_reset。"
         };
