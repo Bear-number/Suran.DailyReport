@@ -30,6 +30,8 @@ namespace Suran.DailyReport;
 
 public class DailyReportConfig
 {
+    /// <summary>界面主题：pink = 粉色（默认），dark = 黑夜。</summary>
+    public string UiTheme { get; set; } = "pink";
     [DisplayName("运行·功能文档常驻")]
     [Description("开：功能说明常驻系统提示词，模型随时看得到工具；关：隐式加载省 token，模型先输出入口标签再读文档。日报多是用户明确要求或定时触发，默认关")]
     public bool DocumentAlwaysResident { get; set; } = false;
